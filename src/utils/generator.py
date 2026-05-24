@@ -97,6 +97,10 @@ from evaluation_pipeline   import evaluate as _eval_fn          # noqa: E402
 from execution_controller  import pipeline_slot                 # noqa: E402
 from diversity_guard       import tag_generated_rows            # noqa: E402
 from drift_store           import DriftStore                    # noqa: E402
+from preprocessing_layer   import (                              # noqa: E402
+    build_manifest, apply_manifest, merge_outputs,
+    PreprocessingManifest, ColumnMergeError,
+)
 
 # ------------------------------------------------------------------
 # Constants
@@ -658,6 +662,7 @@ class ProbabilisticEngine:
         bl:        BaselineReader,
         rng:       np.random.Generator,
         cache_dir: Optional[str] = None,
+        manifest:  Optional["PreprocessingManifest"] = None,
     ) -> None:
         self.bl        = bl
         self.rng       = rng
@@ -676,6 +681,10 @@ class ProbabilisticEngine:
 
         self._fitted      : bool                        = False
 
+        # Preprocessing manifest integration
+        self._manifest : Optional["PreprocessingManifest"] = manifest
+        self._df_orig  : Optional[pd.DataFrame]            = None  # set by fit()
+
     # ------------------------------------------------------------------
     # Public interface
     # ------------------------------------------------------------------
@@ -684,24 +693,37 @@ class ProbabilisticEngine:
         """Fit the Gaussian copula (global + per-class) on df."""
         bl = self.bl
 
-        # Build per-class stats so StatisticalEngine label-path can use them too
+        # Build per-class stats on the ORIGINAL df (not copula_df)
+        # so class stats use real category values for label-first path.
         bl.build_class_stats(df)
 
-        # Only numeric columns enter the copula
-        self._num_cols = [c for c in bl.numeric if c in df.columns]
+        # ── If manifest available: fit copula on copula_df ────────────
+        if self._manifest is not None:
+            self._df_orig = df  # store for apply_manifest calls in sample()
+            copula_df, _ = apply_manifest(
+                self._manifest, df, len(df), self.rng
+            )
+            self._num_cols = list(copula_df.columns)
+        else:
+            copula_df = df
+            self._num_cols = [c for c in bl.numeric if c in df.columns]
 
         # ---- Global copula ----
         if self._num_cols:
-            self._build_copula_from_df(df, self._num_cols)
+            self._build_copula_from_df(copula_df, self._num_cols)
+
+        # Remove any columns that failed copula/CDF construction.
+        # Prevents stale latent dimensions from surviving in _num_cols.
+        self._num_cols = [c for c in self._num_cols if c in self._cdfs]
 
         # ---- Per-class copulas (when label column detected) ----
         if bl.label_col and bl.label_col in df.columns and self._num_cols:
             label_series = df[bl.label_col].astype(str)
             for lv in label_series.unique():
-                sub = df[label_series == lv]
-                if len(sub) < len(self._num_cols) + 2:
+                sub_copula = copula_df.loc[label_series[label_series == lv].index]
+                if len(sub_copula) < len(self._num_cols) + 2:
                     continue  # too few rows for reliable copula
-                mu, cov, cdfs = self._fit_copula_params(sub, self._num_cols)
+                mu, cov, cdfs = self._fit_copula_params(sub_copula, self._num_cols)
                 if mu is not None:
                     self._class_copulas[lv] = {
                         "mu":       mu,
@@ -710,7 +732,7 @@ class ProbabilisticEngine:
                         "num_cols": self._num_cols,
                     }
 
-        # Fit conditional categorical tables
+        # Fit conditional categorical tables (still from df_orig for fallback)
         self._cat_tables = self._build_cat_tables(df)
 
         self._fitted = True
@@ -812,7 +834,10 @@ class ProbabilisticEngine:
                     if col not in cdfs_lv:
                         continue
                     vals, quant = cdfs_lv[col]
-                    spec        = bl.numeric[col]
+                    # Use .get() so encoded cols (e.g. subject__enc) that are not
+                    # in the baseline numeric spec default to unbounded (lo=-inf,
+                    # hi=+inf), avoiding KeyError and skipping needless resampling.
+                    spec        = bl.numeric.get(col, {})
                     lo          = float(spec.get("min", -np.inf))
                     hi          = float(spec.get("max",  np.inf))
                     generated   = np.interp(U_lv[:, i], quant, vals)
@@ -858,8 +883,13 @@ class ProbabilisticEngine:
                 U_samples = ndtr(Z_samples)
 
                 for i, col in enumerate(self._num_cols):
+                    if col not in self._cdfs:
+                        continue  # belt-and-suspenders: skip any col that lost its CDF
                     vals, quant = self._cdfs[col]
-                    spec        = bl.numeric[col]
+                    # Use .get() so encoded cols (e.g. subject__enc) that are not
+                    # in the baseline numeric spec default to unbounded (lo=-inf,
+                    # hi=+inf), avoiding KeyError and skipping needless resampling.
+                    spec        = bl.numeric.get(col, {})
                     lo          = float(spec.get("min", -np.inf))
                     hi          = float(spec.get("max",  np.inf))
                     generated   = np.interp(U_samples[:, i], quant, vals)
@@ -873,6 +903,20 @@ class ProbabilisticEngine:
         for col in bl.other:
             data[col] = np.array([None] * n, dtype=object)
 
+        # ── If manifest: merge copula output with excluded columns ────
+        if self._manifest is not None and self._df_orig is not None:
+            copula_output = pd.DataFrame(
+                {col: data[col] for col in self._num_cols if col in data}
+            )
+            _, excluded_df = apply_manifest(
+                self._manifest, self._df_orig, n, self.rng
+            )
+            # ColumnMergeError propagates — not caught
+            return merge_outputs(
+                copula_output, excluded_df, self._manifest, self.rng
+            )
+
+        # ── Legacy path (no manifest) ─────────────────────────────────
         # Null masks
         for col in bl.col_order:
             nr = bl.null_ratio(col)
@@ -898,6 +942,18 @@ class ProbabilisticEngine:
         if not p:
             return
         os.makedirs(self.cache_dir, exist_ok=True)  # type: ignore[arg-type]
+
+        # Manifest column hash — allows cache invalidation when manifest changes
+        manifest_sig = "noenc"
+        if self._manifest is not None:
+            _enc_cols = (
+                self._manifest.encoder.columns_in_copula
+                if self._manifest.encoder else []
+            )
+            manifest_sig = hashlib.md5(
+                str(sorted(self._manifest.copula_cols + _enc_cols)).encode()
+            ).hexdigest()[:8]
+
         payload = {
             "mu":                  self._mu,
             "cov":                 self._cov,
@@ -909,6 +965,7 @@ class ProbabilisticEngine:
             "label_dist":          self.bl.label_dist,
             "class_cat_stats":     self.bl.class_cat_stats,
             "class_numeric_stats": self.bl.class_numeric_stats,
+            "manifest_col_hash":   manifest_sig,
         }
         safe_dump(payload, p, cache_dir=self.cache_dir)
 
@@ -918,6 +975,21 @@ class ProbabilisticEngine:
             return False
         try:
             payload = safe_load(p, cache_dir=self.cache_dir)
+
+            # Verify manifest_col_hash matches current manifest
+            cached_sig = payload.get("manifest_col_hash", "noenc")
+            current_sig = "noenc"
+            if self._manifest is not None:
+                _enc_cols = (
+                    self._manifest.encoder.columns_in_copula
+                    if self._manifest.encoder else []
+                )
+                current_sig = hashlib.md5(
+                    str(sorted(self._manifest.copula_cols + _enc_cols)).encode()
+                ).hexdigest()[:8]
+            if cached_sig != current_sig:
+                return False  # manifest changed — retrain
+
             self._mu            = payload["mu"]
             self._cov           = payload["cov"]
             self._cdfs          = payload["cdfs"]
@@ -1081,6 +1153,7 @@ class CTGANEngine:
         bl:        BaselineReader,
         rng:       np.random.Generator,
         cache_dir: Optional[str] = None,
+        manifest:  Optional["PreprocessingManifest"] = None,
     ) -> None:
         self.bl         = bl
         self.rng        = rng
@@ -1089,8 +1162,15 @@ class CTGANEngine:
         self._fitted    = False
         self._fallback  : Optional[ProbabilisticEngine] = None
 
+        # Preprocessing manifest integration
+        self._manifest   : Optional["PreprocessingManifest"] = manifest
+        self._df_orig    : Optional[pd.DataFrame]            = None
+        self._ctgan_cols : Optional[List[str]]               = None
+
         if not _CTGAN_AVAILABLE:
-            self._fallback = ProbabilisticEngine(bl, rng, cache_dir)
+            self._fallback = ProbabilisticEngine(
+                bl, rng, cache_dir, manifest=manifest
+            )
 
     def fit(self, df: pd.DataFrame) -> None:
         if self._fallback is not None:
@@ -1100,11 +1180,24 @@ class CTGANEngine:
             self._fitted = True
             return
 
-        # Build discrete (categorical) column list for CTGAN
-        discrete_cols = list(self.bl.categorical.keys())
+        # ── Manifest path: fit CTGAN on copula_df ─────────────────────
+        if self._manifest is not None:
+            self._df_orig = df
+            _fit_rng = np.random.default_rng(42)  # deterministic fit rng
+            copula_df, _ = apply_manifest(
+                self._manifest, df, len(df), _fit_rng
+            )
+            self._ctgan_cols = list(copula_df.columns)
+            # Encoded categoricals are continuous — no discrete_columns
+            self._model = CTGANSynthesizer(epochs=300, verbose=False)
+            self._model.fit(copula_df, discrete_columns=[])
+        else:
+            # Legacy: pass full df with baseline categorical columns as discrete
+            discrete_cols = list(self.bl.categorical.keys())
+            self._model = CTGANSynthesizer(epochs=300, verbose=False)
+            self._model.fit(df, discrete_columns=discrete_cols)
+            self._ctgan_cols = None
 
-        self._model = CTGANSynthesizer(epochs=300, verbose=False)
-        self._model.fit(df, discrete_columns=discrete_cols)
         self._fitted = True
 
     def sample(self, n: int) -> pd.DataFrame:
@@ -1115,7 +1208,23 @@ class CTGANEngine:
             return self._fallback.sample(n)
 
         raw = self._model.sample(n)
-        # Reorder columns to match baseline col_order
+
+        # ── Manifest path: decode via merge_outputs ───────────────────
+        if (self._manifest is not None
+                and self._df_orig is not None
+                and self._ctgan_cols):
+            copula_output = raw[
+                [c for c in self._ctgan_cols if c in raw.columns]
+            ]
+            _, excluded_df = apply_manifest(
+                self._manifest, self._df_orig, n, self.rng
+            )
+            # ColumnMergeError propagates — not caught
+            return merge_outputs(
+                copula_output, excluded_df, self._manifest, self.rng
+            )
+
+        # ── Legacy path: reorder columns to match baseline col_order ──
         present = [c for c in self.bl.col_order if c in raw.columns]
         return raw[present]
 
@@ -1324,6 +1433,26 @@ def _generate_inner(
     cp.reset()
 
     # ════════════════════════════════════════════════════════════════
+    # Load original dataset ONCE — shared by manifest, engine, dedup
+    # ════════════════════════════════════════════════════════════════
+    try:
+        df_orig = _load_original(dataset_path, bl)
+    except Exception as _load_exc:
+        raise PipelineHardFail(
+            message=f"Cannot load original dataset: {_load_exc}",
+            stage="load_original",
+            context={"path": dataset_path},
+        )
+
+    # ════════════════════════════════════════════════════════════════
+    # Build preprocessing manifest (6-type taxonomy + CategoricalEncoder)
+    # ════════════════════════════════════════════════════════════════
+    manifest = build_manifest(df_orig, artifact)
+    if manifest.warnings:
+        for _w in manifest.warnings:
+            output_warnings.append(f"[preprocessing] {_w}")
+
+    # ════════════════════════════════════════════════════════════════
     # Build and train engine
     # ════════════════════════════════════════════════════════════════
     with logger.stage("engine_build") as ctx_eng:
@@ -1331,23 +1460,24 @@ def _generate_inner(
             engine = StatisticalEngine(bl, _seed_mgr.spawn(root_rng, "statistical"))
             if bl.label_col:
                 try:
-                    df_for_stats = _load_original(dataset_path, bl)
-                    bl.build_class_stats(df_for_stats)
+                    bl.build_class_stats(df_orig)
                     output_warnings.append(
                         f"Label column detected (\'{bl.label_col}\'): "
                         "class-conditional statistics built for label-first generation."
                     )
                 except Exception as e:
                     output_warnings.append(
-                        f"Could not load original dataset for class stats "
+                        f"Could not build class stats "
                         f"(falling back to marginal distributions): {e}"
                     )
             actual_engine = StatisticalEngine.ENGINE_NAME
 
         elif engine_name == ProbabilisticEngine.ENGINE_NAME:
-            engine = ProbabilisticEngine(bl, _seed_mgr.spawn(root_rng, "probabilistic"), _cache_dir)
+            engine = ProbabilisticEngine(
+                bl, _seed_mgr.spawn(root_rng, "probabilistic"),
+                _cache_dir, manifest=manifest,
+            )
             if not engine.load_cache():
-                df_orig = _load_original(dataset_path, bl)
                 engine.fit(df_orig)
                 engine.save_cache()
                 output_warnings.append("Probabilistic model fitted and cached.")
@@ -1361,9 +1491,11 @@ def _generate_inner(
             actual_engine = ProbabilisticEngine.ENGINE_NAME
 
         else:  # ctgan
-            engine = CTGANEngine(bl, _seed_mgr.spawn(root_rng, "ctgan"), _cache_dir)
+            engine = CTGANEngine(
+                bl, _seed_mgr.spawn(root_rng, "ctgan"),
+                _cache_dir, manifest=manifest,
+            )
             if not engine.load_cache():
-                df_orig = _load_original(dataset_path, bl)
                 engine.fit(df_orig)
                 engine.save_cache()
                 output_warnings.append("CTGAN model fitted and cached.")
@@ -1381,14 +1513,8 @@ def _generate_inner(
     # Build ValidationLayer
     # ════════════════════════════════════════════════════════════════
     with logger.stage("validation_build") as ctx_vb:
-        try:
-            df_orig_for_dedup = _load_original(dataset_path, bl)
-            ctx_vb.output_rows = len(df_orig_for_dedup)
-        except Exception as e:
-            df_orig_for_dedup = None
-            w = f"DuplicatePreFilter disabled (could not load original dataset): {e}"
-            output_warnings.append(w)
-            ctx_vb.warnings = [w]
+        df_orig_for_dedup = df_orig  # already loaded above
+        ctx_vb.output_rows = len(df_orig_for_dedup)
 
         vl = ValidationLayer(
             bl           = bl,
@@ -2031,6 +2157,13 @@ def _load_original(dataset_path: str, bl: BaselineReader) -> pd.DataFrame:
 # ==================================================================
 
 def _main(argv: Optional[List[str]] = None) -> int:
+    # Force stdout/stderr to UTF-8 on Windows
+    import sys as _sys
+    if hasattr(_sys.stdout, "reconfigure"):
+        _sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(_sys.stderr, "reconfigure"):
+        _sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
     p = argparse.ArgumentParser(
         description="generator.py — Synthetic Data Generation Engine"
     )
@@ -2056,16 +2189,16 @@ def _main(argv: Optional[List[str]] = None) -> int:
             cache_dir     = args.cache_dir,
             seed          = args.seed,
         )
-        print(json.dumps(result, ensure_ascii=False))
+        _sys.stdout.write(json.dumps(result, ensure_ascii=False) + "\n")
         return 0
 
     except PipelineHardFail as hf:
         # Exit code 2 = enforcement failure (structured, actionable)
-        print(json.dumps(hf.to_dict(), ensure_ascii=False), file=sys.stderr)
+        _sys.stderr.write(json.dumps(hf.to_dict(), ensure_ascii=False) + "\n")
         return 2
     except Exception as exc:
         err = {"error": str(exc), "type": type(exc).__name__, "stage": "unknown"}
-        print(json.dumps(err, ensure_ascii=False), file=sys.stderr)
+        _sys.stderr.write(json.dumps(err, ensure_ascii=False) + "\n")
         return 1
 
 
