@@ -105,26 +105,57 @@ if(typeof Chart==='undefined'){
 `;
 exports.DASHBOARD_STYLES = String.raw `
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-:root{
+
+/* ── Theme: Aurora (default) — original purple palette, zero changes ── */
+[data-theme="aurora"]{
   --bg:#0f0f17;--bg2:#13131f;--bg3:#171723;
   --card:#171723;--card2:#1e1e2e;--card3:#252538;
   --fg:#ede5f8;--fg2:#9b8ec4;--fg3:#524870;
   --border:rgba(139,92,246,.18);--border2:rgba(139,92,246,.38);
   --p0:#1e0057;--p1:#4c1d95;--p2:#6d28d9;--p3:#7c3aed;
   --p4:#8b5cf6;--p5:#a78bfa;--p6:#c084fc;--p7:#ddd6fe;
-  --glow:rgba(139,92,246,.45);--glow2:rgba(139,92,246,.18);
   --green:#34d399;--red:#f87171;--orange:#fb923c;--yellow:#fbbf24;
+  --glow:rgba(139,92,246,.4);--glow2:rgba(139,92,246,.18);
+  --bg-hdr:rgba(15,15,23,.96);
   --grad:linear-gradient(135deg,#7c3aed,#9333ea,#a855f7,#c084fc);
   --r:12px;
   --font:var(--vscode-font-family,-apple-system,'Segoe UI',Roboto,sans-serif);
 }
+
+/* ── Theme: Dark — follows VS Code active theme via injected CSS vars ── */
+[data-theme="dark"]{
+  --bg:    var(--vscode-editor-background,      #0f0f17);
+  --bg2:   var(--vscode-sideBar-background,      #13131f);
+  --bg3:   var(--vscode-editorGroupHeader-tabsBackground,#171723);
+  --card:  var(--vscode-sideBar-background,      #171723);
+  --card2: var(--vscode-editor-background,       #1e1e2e);
+  --card3: var(--vscode-editorWidget-background, #252538);
+  --fg:    var(--vscode-editor-foreground,       #ede5f8);
+  --fg2:   var(--vscode-descriptionForeground,   #9b8ec4);
+  --fg3:   var(--vscode-disabledForeground,      #524870);
+  --border: var(--vscode-panel-border,           rgba(139,92,246,.18));
+  --border2:var(--vscode-focusBorder,            rgba(139,92,246,.38));
+  /* Aurora purple palette stays — used for charts/badges only */
+  --p0:#1e0057;--p1:#4c1d95;--p2:#6d28d9;--p3:#7c3aed;
+  --p4:#8b5cf6;--p5:#a78bfa;--p6:#c084fc;--p7:#ddd6fe;
+  --green: var(--vscode-charts-green,  #34d399);
+  --red:   var(--vscode-charts-red,    #f87171);
+  --orange:var(--vscode-charts-orange, #fb923c);
+  --yellow:var(--vscode-charts-yellow, #fbbf24);
+  --glow:rgba(139,92,246,.25);--glow2:rgba(139,92,246,.18);
+  --bg-hdr:var(--vscode-editor-background,rgba(15,15,23,.96));
+  --grad:linear-gradient(135deg,#7c3aed,#9333ea,#a855f7,#c084fc);
+  --r:12px;
+  --font:var(--vscode-font-family,-apple-system,'Segoe UI',Roboto,sans-serif);
+}
+
 html,body{min-height:100%;background:var(--bg);color:var(--fg);font-family:var(--font);font-size:13px;line-height:1.5;overflow-x:hidden}
 ::-webkit-scrollbar{width:5px;height:5px}
 ::-webkit-scrollbar-track{background:transparent}
 ::-webkit-scrollbar-thumb{background:var(--p3);border-radius:3px}
 
 /* Sticky header */
-.hdr{display:flex;align-items:center;justify-content:space-between;padding:10px 20px;border-bottom:1px solid var(--border);background:rgba(15,15,23,.96);position:sticky;top:0;z-index:100;backdrop-filter:blur(18px)}
+.hdr{display:flex;align-items:center;justify-content:space-between;padding:10px 20px;border-bottom:1px solid var(--border);background:var(--bg-hdr);position:sticky;top:0;z-index:100;backdrop-filter:blur(18px)}
 .logo{display:flex;align-items:center;gap:10px}
 .logo-icon{width:32px;height:32px;flex-shrink:0;border-radius:10px;background:var(--grad);display:flex;align-items:center;justify-content:center;font-size:15px;box-shadow:0 0 16px var(--glow)}
 .logo-title{font-size:15px;font-weight:700;letter-spacing:-.025em;background:var(--grad);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
@@ -542,6 +573,12 @@ function renderRiskRadar(){
   
   const ds = l.avg_drift_score != null ? Math.min(l.avg_drift_score * 100, 100) : 0;
 
+  const cs = getComputedStyle(document.documentElement);
+  const p4 = cs.getPropertyValue('--p4').trim() || '#8b5cf6';
+  const p6 = cs.getPropertyValue('--p6').trim() || '#c084fc';
+  const fg2 = cs.getPropertyValue('--fg2').trim() || '#9b8ec4';
+  const gridLine = cs.getPropertyValue('--border').trim() || 'rgba(139,92,246,.18)';
+
   getOrCreateChart('chart-radar', {
     type: 'radar',
     data: {
@@ -552,19 +589,19 @@ function renderRiskRadar(){
         backgroundColor: 'rgba(139, 92, 246, 0.25)',
         borderColor: 'rgba(139, 92, 246, 0.8)',
         borderWidth: 2,
-        pointBackgroundColor: 'var(--p4)',
-        pointBorderColor: '#fff',
-        pointHoverBackgroundColor: '#fff',
-        pointHoverBorderColor: 'var(--p6)'
+        pointBackgroundColor: p4,
+        pointBorderColor: cs.getPropertyValue('--fg').trim() || '#ede5f8',
+        pointHoverBackgroundColor: cs.getPropertyValue('--fg').trim() || '#ede5f8',
+        pointHoverBorderColor: p6
       }]
     },
     options: {
       elements: { line: { tension: 0.3 } },
       scales: { 
         r: { 
-          angleLines: { color: 'rgba(255, 255, 255, 0.1)' }, 
-          grid: { color: 'rgba(255, 255, 255, 0.1)' }, 
-          pointLabels: { color: 'var(--fg2)', font: { size: 9, family: 'var(--font)' } }, 
+          angleLines: { color: gridLine }, 
+          grid: { color: gridLine }, 
+          pointLabels: { color: fg2, font: { size: 9, family: cs.getPropertyValue('--font').trim() || 'sans-serif' } }, 
           ticks: { display:false, min:0, max:100 } 
         } 
       },

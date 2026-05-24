@@ -76,6 +76,8 @@ function getPipelineDir() {
 // ─────────────────────────────────────────────────────────────────────────────
 // ── Global LLM client (shared across commands) ──────────────────────────────
 let llmClient;
+// Active dashboard panel reference (for live theme updates)
+let monitorPanel;
 // ─────────────────────────────────────────────────────────────────────────────
 // Agentic ToolExecutor — bridges LLM tool calls to real system operations
 // ─────────────────────────────────────────────────────────────────────────────
@@ -482,15 +484,23 @@ function activate(context) {
             vscode.window.showTextDocument(doc, vscode.ViewColumn.Beside);
         });
     }));
+    // ── Aurora: Switch Theme (Command Palette) ────────────────────────────────
+    context.subscriptions.push(vscode.commands.registerCommand('aurora.switchTheme', async () => {
+        const choice = await vscode.window.showQuickPick([
+            { label: '$(star) Aurora', description: 'Default purple theme', value: 'aurora' },
+            { label: '$(color-mode) Dark Theme', description: 'Follows your VS Code theme', value: 'dark' }
+        ], { placeHolder: 'Select Aurora theme' });
+        if (!choice) {
+            return;
+        }
+        const theme = choice.value;
+        context.globalState.update('aurora.theme', theme);
+        if (monitorPanel) {
+            monitorPanel.webview.postMessage({ command: 'applyTheme', theme });
+        }
+    }));
     // ── Open Aurora Dashboard directly (standalone, without prior generate) ─
     context.subscriptions.push(vscode.commands.registerCommand('automate.openDashboard', () => {
-        const chartUri = vscode.Uri.joinPath(context.extensionUri, 'media', 'chart.min.js');
-        const emptyData = {
-            result: null, leakage: null, ast: null, baseline: null,
-            cp: null, checkpoint: null,
-            chartUri: '', scanReport: null, attackReport: null,
-            knowledgeGraph: null, lineage: null,
-        };
         showCheckpointMonitor(context, { checkpoint_path: '', generator_used: '', row_count: 0, samples: [] }, null, null, null, null, null, null, null);
     }));
 }
@@ -916,6 +926,60 @@ function runLineageBuilder(context, sourcePath, baselinePath, leakagePath) {
     });
 }
 // ─────────────────────────────────────────────────────────────────────────────
+// Shared report-panel styles (theme-aware)
+// ─────────────────────────────────────────────────────────────────────────────
+function buildReportStyles(theme) {
+    if (theme === 'aurora') {
+        return `<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:var(--vscode-font-family,sans-serif);font-size:13px;color:#ede5f8;background:#0f0f17;padding:20px}
+h2{font-size:15px;margin-bottom:12px;font-weight:600;color:#c084fc}
+.card{background:#171723;border:1px solid #2a2a3b;border-radius:10px;padding:16px;margin-bottom:14px}
+.stat-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(110px,1fr));gap:10px}
+.stat-box label{font-size:10px;text-transform:uppercase;color:#9080b0;display:block;margin-bottom:2px}
+.stat-box span{font-size:18px;font-weight:700}
+table{width:100%;border-collapse:collapse;font-size:11px;margin-top:8px}
+th{text-align:left;padding:5px 8px;background:#1a1a2e;font-size:10px;text-transform:uppercase;letter-spacing:.05em;color:#9080b0}
+td{padding:5px 8px;border-bottom:1px solid rgba(139,92,246,.08)}
+.gen-row{display:flex;align-items:center;gap:10px;margin-bottom:12px}
+input[type=number]{background:#1e1e2e;border:1px solid #2a2a3b;color:#ede5f8;border-radius:6px;padding:5px 8px;font-size:13px;width:90px}
+button{background:linear-gradient(135deg,#7c3aed,#9333ea);color:#fff;border:none;border-radius:6px;padding:6px 16px;font-size:13px;cursor:pointer;font-weight:500}
+button:hover{opacity:.85}
+#status{font-size:12px;color:#9080b0;margin-top:8px}
+</style>`;
+    }
+    // 'dark' — follows VS Code active theme
+    return `<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:var(--vscode-font-family,sans-serif);font-size:13px;
+  color:var(--vscode-editor-foreground,#ede5f8);
+  background:var(--vscode-editor-background,#0f0f17);padding:20px}
+h2{font-size:15px;margin-bottom:12px;font-weight:600;color:var(--vscode-textLink-foreground,#c084fc)}
+.card{background:var(--vscode-sideBar-background,#171723);
+  border:1px solid var(--vscode-panel-border,#2a2a3b);
+  border-radius:10px;padding:16px;margin-bottom:14px}
+.stat-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(110px,1fr));gap:10px}
+.stat-box label{font-size:10px;text-transform:uppercase;
+  color:var(--vscode-descriptionForeground,#9080b0);display:block;margin-bottom:2px}
+.stat-box span{font-size:18px;font-weight:700}
+table{width:100%;border-collapse:collapse;font-size:11px;margin-top:8px}
+th{text-align:left;padding:5px 8px;
+  background:var(--vscode-editorWidget-background,#1a1a2e);
+  font-size:10px;text-transform:uppercase;letter-spacing:.05em;
+  color:var(--vscode-descriptionForeground,#9080b0)}
+td{padding:5px 8px;border-bottom:1px solid rgba(139,92,246,.08)}
+.gen-row{display:flex;align-items:center;gap:10px;margin-bottom:12px}
+input[type=number]{background:var(--vscode-input-background,#1e1e2e);
+  border:1px solid var(--vscode-input-border,#2a2a3b);
+  color:var(--vscode-input-foreground,#ede5f8);
+  border-radius:6px;padding:5px 8px;font-size:13px;width:90px}
+button{background:linear-gradient(135deg,#7c3aed,#9333ea);color:#fff;
+  border:none;border-radius:6px;padding:6px 16px;font-size:13px;cursor:pointer;font-weight:500}
+button:hover{opacity:.85}
+#status{font-size:12px;color:var(--vscode-descriptionForeground,#9080b0);margin-top:8px}
+</style>`;
+}
+// ─────────────────────────────────────────────────────────────────────────────
 // Show PII scan report in a new panel
 // ─────────────────────────────────────────────────────────────────────────────
 function showScanReport(context, report, filePath) {
@@ -928,17 +992,9 @@ function showScanReport(context, report, filePath) {
         .slice(0, 50)
         .map((f) => `<tr><td>${esc(f.type)}</td><td>${esc(f.category)}</td><td>${esc(f.column)}</td><td>${esc(f.severity)}</td><td>${esc(f.value_preview || '—')}</td></tr>`)
         .join('');
+    const theme = context.globalState.get('aurora.theme', 'aurora');
     panel.webview.html = `<!DOCTYPE html><html><head><meta charset="UTF-8"/>
-<style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:var(--vscode-font-family,sans-serif);font-size:13px;color:#ede5f8;background:#0f0f17;padding:20px}
-.card{background:#171723;border:1px solid #2a2a3b;border-radius:10px;padding:16px;margin-bottom:14px}
-h2{font-size:15px;margin-bottom:12px;font-weight:600;color:#c084fc}
-.stat-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:10px}
-.stat-box label{font-size:10px;text-transform:uppercase;color:#9080b0;display:block;margin-bottom:2px}
-.stat-box span{font-size:18px;font-weight:700}
-table{width:100%;border-collapse:collapse;font-size:11px;margin-top:8px}
-th{text-align:left;padding:5px 8px;background:#1a1a2e;font-size:10px;text-transform:uppercase;letter-spacing:.05em;color:#9080b0}
-td{padding:5px 8px;border-bottom:1px solid rgba(139,92,246,.08)}
-</style></head><body>
+${buildReportStyles(theme)}</head><body>
 <div class="card"><h2>🛡️ PII & Security Scan Report</h2><p style="font-size:11px;color:#9080b0">${esc(path.basename(filePath))}</p></div>
 <div class="card"><div class="stat-grid">
 <div class="stat-box"><label>PII Findings</label><span style="color:#f59e0b">${n_pii}</span></div>
@@ -974,11 +1030,9 @@ function showAttackReport(context, report) {
         </div>`;
     }).join('');
     const recsHtml = (report.recommendations || []).map((r) => `<li style="font-size:11px;color:#9080b0;margin-bottom:4px">💡 ${esc(r)}</li>`).join('');
+    const theme = context.globalState.get('aurora.theme', 'aurora');
     panel.webview.html = `<!DOCTYPE html><html><head><meta charset="UTF-8"/>
-<style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:var(--vscode-font-family,sans-serif);color:#ede5f8;background:#0f0f17;padding:20px}
-.card{background:#171723;border:1px solid #2a2a3b;border-radius:10px;padding:16px;margin-bottom:14px}
-h2{font-size:15px;margin-bottom:12px;font-weight:600;color:#c084fc}
-</style></head><body>
+${buildReportStyles(theme)}</head><body>
 <div class="card"><h2>⚔️ Attack Simulation Report</h2>
 <p style="font-size:12px;margin-bottom:8px">Vulnerability: <span style="color:${vulnColor};font-weight:700;text-transform:uppercase">${esc(report.overall_vulnerability)}</span></p>
 <p style="font-size:11px;color:#9080b0">${esc(report.summary)}</p></div>
@@ -1015,25 +1069,10 @@ function showCombinedResult(context, ast, baseline, filePath) {
           <td style="text-align:right">${misSt}</td>
         </tr>`;
     }).join('');
+    const theme = context.globalState.get('aurora.theme', 'aurora');
     panel.webview.html = `<!DOCTYPE html>
 <html><head><meta charset="UTF-8"/>
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:var(--vscode-font-family,sans-serif);font-size:13px;color:#ede5f8;background:#0f0f17;padding:20px}
-h2{font-size:15px;margin-bottom:12px;font-weight:600;color:#c084fc}
-.card{background:#171723;border:1px solid #2a2a3b;border-radius:10px;padding:16px;margin-bottom:14px}
-table{width:100%;border-collapse:collapse;font-size:12px}
-th{text-align:left;padding:5px 8px;background:#1a1a2e;font-size:10px;text-transform:uppercase;letter-spacing:.05em;color:#9080b0}
-td{padding:6px 8px;border-bottom:1px solid rgba(139,92,246,.08)}
-.stat-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(110px,1fr));gap:10px}
-.stat-box label{font-size:10px;text-transform:uppercase;color:#9080b0;display:block;margin-bottom:2px}
-.stat-box span{font-size:16px;font-weight:700;color:#c084fc}
-.gen-row{display:flex;align-items:center;gap:10px;margin-bottom:12px}
-input[type=number]{background:#1e1e2e;border:1px solid #2a2a3b;color:#ede5f8;border-radius:6px;padding:5px 8px;font-size:13px;width:90px}
-button{background:linear-gradient(135deg,#7c3aed,#9333ea);color:#fff;border:none;border-radius:6px;padding:6px 16px;font-size:13px;cursor:pointer;font-weight:500}
-button:hover{opacity:.85}
-#status{font-size:12px;color:#9080b0;margin-top:8px}
-</style></head><body>
+${buildReportStyles(theme)}</head><body>
 <div class="card">
   <h2>📄 Dataset Overview</h2>
   <div class="stat-grid">
@@ -1264,7 +1303,10 @@ function showCheckpointMonitor(context, result, leakageResult, ast, baseline, sc
         knowledgeGraph: knowledgeGraph ?? null,
         lineage: lineageData ?? null,
     };
-    panel.webview.html = (0, monitorPanel_1.buildMonitorHtml)(dashboardData);
+    // ── Theme: read saved preference, default to 'aurora' ──────────────────────────
+    const savedTheme = context.globalState.get('aurora.theme', 'aurora');
+    panel.webview.html = (0, monitorPanel_1.buildMonitorHtml)(dashboardData, savedTheme);
+    monitorPanel = panel;
     // Register panel for live alert forwarding
     const activePanels = global.__automatePanels ?? new Set();
     activePanels.add(panel);
@@ -1278,6 +1320,13 @@ function showCheckpointMonitor(context, result, leakageResult, ast, baseline, sc
     }
     panel.onDidDispose(() => {
         activePanels.delete(panel);
+        monitorPanel = undefined;
+    }, null, context.subscriptions);
+    // VS Code re-injects its CSS vars automatically on theme change.
+    // We only need to notify the webview so it can re-read computed CSS vars
+    // for JS-driven colors (e.g. Chart.js datasets).
+    vscode.window.onDidChangeActiveColorTheme(() => {
+        panel.webview.postMessage({ command: 'themeChanged' });
     }, null, context.subscriptions);
     panel.webview.onDidReceiveMessage(async (msg) => {
         try {

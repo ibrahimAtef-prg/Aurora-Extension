@@ -231,6 +231,13 @@ def generate_dataset_card(
 # ============================================================
 
 def main(argv=None):
+    # Force stdout/stderr to UTF-8 on Windows
+    import sys as _sys
+    if hasattr(_sys.stdout, "reconfigure"):
+        _sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(_sys.stderr, "reconfigure"):
+        _sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
     import argparse
     p = argparse.ArgumentParser(description="Dataset Documentation Generator")
     p.add_argument("--baseline", required=True, help="Path to baseline JSON")
@@ -262,9 +269,9 @@ def main(argv=None):
     if args.output:
         with open(args.output, "w", encoding="utf-8") as f:
             f.write(md)
-        print(f"Card saved to {args.output}", file=sys.stderr)
+        _sys.stderr.write(f"Card saved to {args.output}\n")
     else:
-        print(md)
+        _sys.stdout.write(md + "\n")
 
     return 0
 

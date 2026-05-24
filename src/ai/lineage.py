@@ -208,6 +208,13 @@ def build_lineage_from_artifacts(
 # ============================================================
 
 def main(argv=None):
+    # Force stdout/stderr to UTF-8 on Windows
+    import sys as _sys
+    if hasattr(_sys.stdout, "reconfigure"):
+        _sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(_sys.stderr, "reconfigure"):
+        _sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
     import argparse
     p = argparse.ArgumentParser(description="Data Lineage Tracker")
     p.add_argument("--source", required=True, help="Source dataset path")
@@ -236,7 +243,7 @@ def main(argv=None):
         with open(args.output, "w", encoding="utf-8") as f:
             f.write(record.to_json())
     else:
-        print(record.to_json())
+        _sys.stdout.write(record.to_json() + "\n")
 
     return 0
 

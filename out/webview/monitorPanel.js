@@ -23,10 +23,10 @@ const agent_1 = require("./ui/agent");
 function esc(s) {
     return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
-function buildMonitorHtml(data) {
+function buildMonitorHtml(data, theme = 'aurora') {
     const dataJson = JSON.stringify(data).replace(/<\/script/gi, '<\\/script');
     return `<!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="${theme}">
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
@@ -249,6 +249,17 @@ function doExportReport(){
     filename:'leakage_report.json'});
 }
 
+// ── VS Code theme change — re-read computed CSS vars for JS-driven charts ────
+window.addEventListener('message', function(ev) {
+  if (ev.data && ev.data.command === 'themeChanged') {
+    try { renderRiskRadar(); } catch(e) {}
+  }
+  if (ev.data && ev.data.command === 'applyTheme') {
+    document.documentElement.dataset.theme = ev.data.theme;
+    try { renderRiskRadar(); } catch(e) {}
+  }
+});
+
 // ── Incremental postMessage update ───────────────────────────────────
 window.addEventListener('message',function(ev){
   var msg=ev.data;
@@ -355,8 +366,6 @@ ${agent_1.AGENT_SCRIPT}
 ${security_1.SECURITY_SCRIPT}
 
 ${livesecurity_1.LIVE_SECURITY_SCRIPT}
-
-// ── End Phase 4 Live Security ────────────────────────────────────────────────
 
 // renderIntelligenceRisk, renderColumnRanking, renderRecommendations
 // are defined in OVERVIEW_SCRIPT — do not redeclare here.

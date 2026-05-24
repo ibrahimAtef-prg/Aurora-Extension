@@ -82,6 +82,8 @@ function getPipelineDir() {
 // ─────────────────────────────────────────────────────────────────────────────
 // ── Global LLM client (shared across commands) ──────────────────────────────
 let llmClient;
+// Active dashboard panel reference (for live theme updates)
+let monitorPanel;
 // ─────────────────────────────────────────────────────────────────────────────
 // Agentic ToolExecutor — bridges LLM tool calls to real system operations
 // ─────────────────────────────────────────────────────────────────────────────
@@ -488,15 +490,23 @@ function activate(context) {
             vscode.window.showTextDocument(doc, vscode.ViewColumn.Beside);
         });
     }));
+    // ── Aurora: Switch Theme (Command Palette) ────────────────────────────────
+    context.subscriptions.push(vscode.commands.registerCommand('aurora.switchTheme', async () => {
+        const choice = await vscode.window.showQuickPick([
+            { label: '$(star) Aurora', description: 'Default purple theme', value: 'aurora' },
+            { label: '$(color-mode) Dark Theme', description: 'Follows your VS Code theme', value: 'dark' }
+        ], { placeHolder: 'Select Aurora theme' });
+        if (!choice) {
+            return;
+        }
+        const theme = choice.value;
+        context.globalState.update('aurora.theme', theme);
+        if (monitorPanel) {
+            monitorPanel.webview.postMessage({ command: 'applyTheme', theme });
+        }
+    }));
     // ── Open Aurora Dashboard directly (standalone, without prior generate) ─
     context.subscriptions.push(vscode.commands.registerCommand('automate.openDashboard', () => {
-        const chartUri = vscode.Uri.joinPath(context.extensionUri, 'media', 'chart.min.js');
-        const emptyData = {
-            result: null, leakage: null, ast: null, baseline: null,
-            cp: null, checkpoint: null,
-            chartUri: '', scanReport: null, attackReport: null,
-            knowledgeGraph: null, lineage: null,
-        };
         showCheckpointMonitor(context, { checkpoint_path: '', generator_used: '', row_count: 0, samples: [] }, null, null, null, null, null, null, null);
     }));
 }
@@ -922,6 +932,60 @@ function runLineageBuilder(context, sourcePath, baselinePath, leakagePath) {
     });
 }
 // ─────────────────────────────────────────────────────────────────────────────
+// Shared report-panel styles (theme-aware)
+// ─────────────────────────────────────────────────────────────────────────────
+function buildReportStyles(theme) {
+    if (theme === 'aurora') {
+        return `<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:var(--vscode-font-family,sans-serif);font-size:13px;color:#ede5f8;background:#0f0f17;padding:20px}
+h2{font-size:15px;margin-bottom:12px;font-weight:600;color:#c084fc}
+.card{background:#171723;border:1px solid #2a2a3b;border-radius:10px;padding:16px;margin-bottom:14px}
+.stat-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(110px,1fr));gap:10px}
+.stat-box label{font-size:10px;text-transform:uppercase;color:#9080b0;display:block;margin-bottom:2px}
+.stat-box span{font-size:18px;font-weight:700}
+table{width:100%;border-collapse:collapse;font-size:11px;margin-top:8px}
+th{text-align:left;padding:5px 8px;background:#1a1a2e;font-size:10px;text-transform:uppercase;letter-spacing:.05em;color:#9080b0}
+td{padding:5px 8px;border-bottom:1px solid rgba(139,92,246,.08)}
+.gen-row{display:flex;align-items:center;gap:10px;margin-bottom:12px}
+input[type=number]{background:#1e1e2e;border:1px solid #2a2a3b;color:#ede5f8;border-radius:6px;padding:5px 8px;font-size:13px;width:90px}
+button{background:linear-gradient(135deg,#7c3aed,#9333ea);color:#fff;border:none;border-radius:6px;padding:6px 16px;font-size:13px;cursor:pointer;font-weight:500}
+button:hover{opacity:.85}
+#status{font-size:12px;color:#9080b0;margin-top:8px}
+</style>`;
+    }
+    // 'dark' — follows VS Code active theme
+    return `<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:var(--vscode-font-family,sans-serif);font-size:13px;
+  color:var(--vscode-editor-foreground,#ede5f8);
+  background:var(--vscode-editor-background,#0f0f17);padding:20px}
+h2{font-size:15px;margin-bottom:12px;font-weight:600;color:var(--vscode-textLink-foreground,#c084fc)}
+.card{background:var(--vscode-sideBar-background,#171723);
+  border:1px solid var(--vscode-panel-border,#2a2a3b);
+  border-radius:10px;padding:16px;margin-bottom:14px}
+.stat-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(110px,1fr));gap:10px}
+.stat-box label{font-size:10px;text-transform:uppercase;
+  color:var(--vscode-descriptionForeground,#9080b0);display:block;margin-bottom:2px}
+.stat-box span{font-size:18px;font-weight:700}
+table{width:100%;border-collapse:collapse;font-size:11px;margin-top:8px}
+th{text-align:left;padding:5px 8px;
+  background:var(--vscode-editorWidget-background,#1a1a2e);
+  font-size:10px;text-transform:uppercase;letter-spacing:.05em;
+  color:var(--vscode-descriptionForeground,#9080b0)}
+td{padding:5px 8px;border-bottom:1px solid rgba(139,92,246,.08)}
+.gen-row{display:flex;align-items:center;gap:10px;margin-bottom:12px}
+input[type=number]{background:var(--vscode-input-background,#1e1e2e);
+  border:1px solid var(--vscode-input-border,#2a2a3b);
+  color:var(--vscode-input-foreground,#ede5f8);
+  border-radius:6px;padding:5px 8px;font-size:13px;width:90px}
+button{background:linear-gradient(135deg,#7c3aed,#9333ea);color:#fff;
+  border:none;border-radius:6px;padding:6px 16px;font-size:13px;cursor:pointer;font-weight:500}
+button:hover{opacity:.85}
+#status{font-size:12px;color:var(--vscode-descriptionForeground,#9080b0);margin-top:8px}
+</style>`;
+}
+// ─────────────────────────────────────────────────────────────────────────────
 // Show PII scan report in a new panel
 // ─────────────────────────────────────────────────────────────────────────────
 function showScanReport(context, report, filePath) {
@@ -934,17 +998,9 @@ function showScanReport(context, report, filePath) {
         .slice(0, 50)
         .map((f) => `<tr><td>${esc(f.type)}</td><td>${esc(f.category)}</td><td>${esc(f.column)}</td><td>${esc(f.severity)}</td><td>${esc(f.value_preview || '—')}</td></tr>`)
         .join('');
+    const theme = context.globalState.get('aurora.theme', 'aurora');
     panel.webview.html = `<!DOCTYPE html><html><head><meta charset="UTF-8"/>
-<style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:var(--vscode-font-family,sans-serif);font-size:13px;color:#ede5f8;background:#0f0f17;padding:20px}
-.card{background:#171723;border:1px solid #2a2a3b;border-radius:10px;padding:16px;margin-bottom:14px}
-h2{font-size:15px;margin-bottom:12px;font-weight:600;color:#c084fc}
-.stat-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:10px}
-.stat-box label{font-size:10px;text-transform:uppercase;color:#9080b0;display:block;margin-bottom:2px}
-.stat-box span{font-size:18px;font-weight:700}
-table{width:100%;border-collapse:collapse;font-size:11px;margin-top:8px}
-th{text-align:left;padding:5px 8px;background:#1a1a2e;font-size:10px;text-transform:uppercase;letter-spacing:.05em;color:#9080b0}
-td{padding:5px 8px;border-bottom:1px solid rgba(139,92,246,.08)}
-</style></head><body>
+${buildReportStyles(theme)}</head><body>
 <div class="card"><h2>🛡️ PII & Security Scan Report</h2><p style="font-size:11px;color:#9080b0">${esc(path.basename(filePath))}</p></div>
 <div class="card"><div class="stat-grid">
 <div class="stat-box"><label>PII Findings</label><span style="color:#f59e0b">${n_pii}</span></div>
@@ -980,11 +1036,9 @@ function showAttackReport(context, report) {
         </div>`;
     }).join('');
     const recsHtml = (report.recommendations || []).map((r) => `<li style="font-size:11px;color:#9080b0;margin-bottom:4px">💡 ${esc(r)}</li>`).join('');
+    const theme = context.globalState.get('aurora.theme', 'aurora');
     panel.webview.html = `<!DOCTYPE html><html><head><meta charset="UTF-8"/>
-<style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:var(--vscode-font-family,sans-serif);color:#ede5f8;background:#0f0f17;padding:20px}
-.card{background:#171723;border:1px solid #2a2a3b;border-radius:10px;padding:16px;margin-bottom:14px}
-h2{font-size:15px;margin-bottom:12px;font-weight:600;color:#c084fc}
-</style></head><body>
+${buildReportStyles(theme)}</head><body>
 <div class="card"><h2>⚔️ Attack Simulation Report</h2>
 <p style="font-size:12px;margin-bottom:8px">Vulnerability: <span style="color:${vulnColor};font-weight:700;text-transform:uppercase">${esc(report.overall_vulnerability)}</span></p>
 <p style="font-size:11px;color:#9080b0">${esc(report.summary)}</p></div>
@@ -1021,25 +1075,10 @@ function showCombinedResult(context, ast, baseline, filePath) {
           <td style="text-align:right">${misSt}</td>
         </tr>`;
     }).join('');
+    const theme = context.globalState.get('aurora.theme', 'aurora');
     panel.webview.html = `<!DOCTYPE html>
 <html><head><meta charset="UTF-8"/>
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:var(--vscode-font-family,sans-serif);font-size:13px;color:#ede5f8;background:#0f0f17;padding:20px}
-h2{font-size:15px;margin-bottom:12px;font-weight:600;color:#c084fc}
-.card{background:#171723;border:1px solid #2a2a3b;border-radius:10px;padding:16px;margin-bottom:14px}
-table{width:100%;border-collapse:collapse;font-size:12px}
-th{text-align:left;padding:5px 8px;background:#1a1a2e;font-size:10px;text-transform:uppercase;letter-spacing:.05em;color:#9080b0}
-td{padding:6px 8px;border-bottom:1px solid rgba(139,92,246,.08)}
-.stat-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(110px,1fr));gap:10px}
-.stat-box label{font-size:10px;text-transform:uppercase;color:#9080b0;display:block;margin-bottom:2px}
-.stat-box span{font-size:16px;font-weight:700;color:#c084fc}
-.gen-row{display:flex;align-items:center;gap:10px;margin-bottom:12px}
-input[type=number]{background:#1e1e2e;border:1px solid #2a2a3b;color:#ede5f8;border-radius:6px;padding:5px 8px;font-size:13px;width:90px}
-button{background:linear-gradient(135deg,#7c3aed,#9333ea);color:#fff;border:none;border-radius:6px;padding:6px 16px;font-size:13px;cursor:pointer;font-weight:500}
-button:hover{opacity:.85}
-#status{font-size:12px;color:#9080b0;margin-top:8px}
-</style></head><body>
+${buildReportStyles(theme)}</head><body>
 <div class="card">
   <h2>📄 Dataset Overview</h2>
   <div class="stat-grid">
@@ -1270,7 +1309,10 @@ function showCheckpointMonitor(context, result, leakageResult, ast, baseline, sc
         knowledgeGraph: knowledgeGraph ?? null,
         lineage: lineageData ?? null,
     };
-    panel.webview.html = (0, monitorPanel_1.buildMonitorHtml)(dashboardData);
+    // ── Theme: read saved preference, default to 'aurora' ──────────────────────────
+    const savedTheme = context.globalState.get('aurora.theme', 'aurora');
+    panel.webview.html = (0, monitorPanel_1.buildMonitorHtml)(dashboardData, savedTheme);
+    monitorPanel = panel;
     // Register panel for live alert forwarding
     const activePanels = global.__automatePanels ?? new Set();
     activePanels.add(panel);
@@ -1284,6 +1326,13 @@ function showCheckpointMonitor(context, result, leakageResult, ast, baseline, sc
     }
     panel.onDidDispose(() => {
         activePanels.delete(panel);
+        monitorPanel = undefined;
+    }, null, context.subscriptions);
+    // VS Code re-injects its CSS vars automatically on theme change.
+    // We only need to notify the webview so it can re-read computed CSS vars
+    // for JS-driven colors (e.g. Chart.js datasets).
+    vscode.window.onDidChangeActiveColorTheme(() => {
+        panel.webview.postMessage({ command: 'themeChanged' });
     }, null, context.subscriptions);
     panel.webview.onDidReceiveMessage(async (msg) => {
         try {
@@ -1764,10 +1813,10 @@ const agent_1 = __webpack_require__(12);
 function esc(s) {
     return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
-function buildMonitorHtml(data) {
+function buildMonitorHtml(data, theme = 'aurora') {
     const dataJson = JSON.stringify(data).replace(/<\/script/gi, '<\\/script');
     return `<!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="${theme}">
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
@@ -1990,6 +2039,17 @@ function doExportReport(){
     filename:'leakage_report.json'});
 }
 
+// ── VS Code theme change — re-read computed CSS vars for JS-driven charts ────
+window.addEventListener('message', function(ev) {
+  if (ev.data && ev.data.command === 'themeChanged') {
+    try { renderRiskRadar(); } catch(e) {}
+  }
+  if (ev.data && ev.data.command === 'applyTheme') {
+    document.documentElement.dataset.theme = ev.data.theme;
+    try { renderRiskRadar(); } catch(e) {}
+  }
+});
+
 // ── Incremental postMessage update ───────────────────────────────────
 window.addEventListener('message',function(ev){
   var msg=ev.data;
@@ -2096,8 +2156,6 @@ ${agent_1.AGENT_SCRIPT}
 ${security_1.SECURITY_SCRIPT}
 
 ${livesecurity_1.LIVE_SECURITY_SCRIPT}
-
-// ── End Phase 4 Live Security ────────────────────────────────────────────────
 
 // renderIntelligenceRisk, renderColumnRanking, renderRecommendations
 // are defined in OVERVIEW_SCRIPT — do not redeclare here.
@@ -2286,26 +2344,57 @@ if(typeof Chart==='undefined'){
 `;
 exports.DASHBOARD_STYLES = String.raw `
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-:root{
+
+/* ── Theme: Aurora (default) — original purple palette, zero changes ── */
+[data-theme="aurora"]{
   --bg:#0f0f17;--bg2:#13131f;--bg3:#171723;
   --card:#171723;--card2:#1e1e2e;--card3:#252538;
   --fg:#ede5f8;--fg2:#9b8ec4;--fg3:#524870;
   --border:rgba(139,92,246,.18);--border2:rgba(139,92,246,.38);
   --p0:#1e0057;--p1:#4c1d95;--p2:#6d28d9;--p3:#7c3aed;
   --p4:#8b5cf6;--p5:#a78bfa;--p6:#c084fc;--p7:#ddd6fe;
-  --glow:rgba(139,92,246,.45);--glow2:rgba(139,92,246,.18);
   --green:#34d399;--red:#f87171;--orange:#fb923c;--yellow:#fbbf24;
+  --glow:rgba(139,92,246,.4);--glow2:rgba(139,92,246,.18);
+  --bg-hdr:rgba(15,15,23,.96);
   --grad:linear-gradient(135deg,#7c3aed,#9333ea,#a855f7,#c084fc);
   --r:12px;
   --font:var(--vscode-font-family,-apple-system,'Segoe UI',Roboto,sans-serif);
 }
+
+/* ── Theme: Dark — follows VS Code active theme via injected CSS vars ── */
+[data-theme="dark"]{
+  --bg:    var(--vscode-editor-background,      #0f0f17);
+  --bg2:   var(--vscode-sideBar-background,      #13131f);
+  --bg3:   var(--vscode-editorGroupHeader-tabsBackground,#171723);
+  --card:  var(--vscode-sideBar-background,      #171723);
+  --card2: var(--vscode-editor-background,       #1e1e2e);
+  --card3: var(--vscode-editorWidget-background, #252538);
+  --fg:    var(--vscode-editor-foreground,       #ede5f8);
+  --fg2:   var(--vscode-descriptionForeground,   #9b8ec4);
+  --fg3:   var(--vscode-disabledForeground,      #524870);
+  --border: var(--vscode-panel-border,           rgba(139,92,246,.18));
+  --border2:var(--vscode-focusBorder,            rgba(139,92,246,.38));
+  /* Aurora purple palette stays — used for charts/badges only */
+  --p0:#1e0057;--p1:#4c1d95;--p2:#6d28d9;--p3:#7c3aed;
+  --p4:#8b5cf6;--p5:#a78bfa;--p6:#c084fc;--p7:#ddd6fe;
+  --green: var(--vscode-charts-green,  #34d399);
+  --red:   var(--vscode-charts-red,    #f87171);
+  --orange:var(--vscode-charts-orange, #fb923c);
+  --yellow:var(--vscode-charts-yellow, #fbbf24);
+  --glow:rgba(139,92,246,.25);--glow2:rgba(139,92,246,.18);
+  --bg-hdr:var(--vscode-editor-background,rgba(15,15,23,.96));
+  --grad:linear-gradient(135deg,#7c3aed,#9333ea,#a855f7,#c084fc);
+  --r:12px;
+  --font:var(--vscode-font-family,-apple-system,'Segoe UI',Roboto,sans-serif);
+}
+
 html,body{min-height:100%;background:var(--bg);color:var(--fg);font-family:var(--font);font-size:13px;line-height:1.5;overflow-x:hidden}
 ::-webkit-scrollbar{width:5px;height:5px}
 ::-webkit-scrollbar-track{background:transparent}
 ::-webkit-scrollbar-thumb{background:var(--p3);border-radius:3px}
 
 /* Sticky header */
-.hdr{display:flex;align-items:center;justify-content:space-between;padding:10px 20px;border-bottom:1px solid var(--border);background:rgba(15,15,23,.96);position:sticky;top:0;z-index:100;backdrop-filter:blur(18px)}
+.hdr{display:flex;align-items:center;justify-content:space-between;padding:10px 20px;border-bottom:1px solid var(--border);background:var(--bg-hdr);position:sticky;top:0;z-index:100;backdrop-filter:blur(18px)}
 .logo{display:flex;align-items:center;gap:10px}
 .logo-icon{width:32px;height:32px;flex-shrink:0;border-radius:10px;background:var(--grad);display:flex;align-items:center;justify-content:center;font-size:15px;box-shadow:0 0 16px var(--glow)}
 .logo-title{font-size:15px;font-weight:700;letter-spacing:-.025em;background:var(--grad);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
@@ -2723,6 +2812,12 @@ function renderRiskRadar(){
   
   const ds = l.avg_drift_score != null ? Math.min(l.avg_drift_score * 100, 100) : 0;
 
+  const cs = getComputedStyle(document.documentElement);
+  const p4 = cs.getPropertyValue('--p4').trim() || '#8b5cf6';
+  const p6 = cs.getPropertyValue('--p6').trim() || '#c084fc';
+  const fg2 = cs.getPropertyValue('--fg2').trim() || '#9b8ec4';
+  const gridLine = cs.getPropertyValue('--border').trim() || 'rgba(139,92,246,.18)';
+
   getOrCreateChart('chart-radar', {
     type: 'radar',
     data: {
@@ -2733,19 +2828,19 @@ function renderRiskRadar(){
         backgroundColor: 'rgba(139, 92, 246, 0.25)',
         borderColor: 'rgba(139, 92, 246, 0.8)',
         borderWidth: 2,
-        pointBackgroundColor: 'var(--p4)',
-        pointBorderColor: '#fff',
-        pointHoverBackgroundColor: '#fff',
-        pointHoverBorderColor: 'var(--p6)'
+        pointBackgroundColor: p4,
+        pointBorderColor: cs.getPropertyValue('--fg').trim() || '#ede5f8',
+        pointHoverBackgroundColor: cs.getPropertyValue('--fg').trim() || '#ede5f8',
+        pointHoverBorderColor: p6
       }]
     },
     options: {
       elements: { line: { tension: 0.3 } },
       scales: { 
         r: { 
-          angleLines: { color: 'rgba(255, 255, 255, 0.1)' }, 
-          grid: { color: 'rgba(255, 255, 255, 0.1)' }, 
-          pointLabels: { color: 'var(--fg2)', font: { size: 9, family: 'var(--font)' } }, 
+          angleLines: { color: gridLine }, 
+          grid: { color: gridLine }, 
+          pointLabels: { color: fg2, font: { size: 9, family: cs.getPropertyValue('--font').trim() || 'sans-serif' } }, 
           ticks: { display:false, min:0, max:100 } 
         } 
       },

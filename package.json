@@ -80,6 +80,11 @@
       {
         "command": "automate.agentReport",
         "title": "AutoMate: Generate Full Governance Report"
+      },
+      {
+        "command": "aurora.switchTheme",
+        "title": "Aurora: Switch Theme",
+        "category": "Aurora"
       }
     ]
   },

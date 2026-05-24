@@ -445,6 +445,13 @@ class AttackSimulator:
 # ============================================================
 
 def main(argv=None):
+    # Force stdout/stderr to UTF-8 on Windows
+    import sys as _sys
+    if hasattr(_sys.stdout, "reconfigure"):
+        _sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(_sys.stderr, "reconfigure"):
+        _sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
     import argparse
     p = argparse.ArgumentParser(description="Attack Simulator — Privacy attack simulation")
     p.add_argument("--original", required=True, help="Original dataset path")
@@ -454,7 +461,7 @@ def main(argv=None):
     args = p.parse_args(argv)
 
     if pd is None:
-        print(json.dumps({"error": "pandas/numpy required"}))
+        _sys.stdout.write(json.dumps({"error": "pandas/numpy required"}) + "\n")
         return 1
 
     def load(path):
@@ -478,9 +485,9 @@ def main(argv=None):
     if args.output:
         with open(args.output, "w", encoding="utf-8") as f:
             f.write(report.to_json())
-        print(f"Report saved to {args.output}", file=sys.stderr)
+        _sys.stderr.write(f"Report saved to {args.output}\n")
     else:
-        print(report.to_json())
+        _sys.stdout.write(report.to_json() + "\n")
 
     return 0
 

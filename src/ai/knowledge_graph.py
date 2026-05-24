@@ -281,6 +281,13 @@ class KnowledgeGraphBuilder:
 # ============================================================
 
 def main(argv=None):
+    # Force stdout/stderr to UTF-8 on Windows
+    import sys as _sys
+    if hasattr(_sys.stdout, "reconfigure"):
+        _sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(_sys.stderr, "reconfigure"):
+        _sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
     import argparse
     p = argparse.ArgumentParser(description="Knowledge Graph Builder")
     p.add_argument("--baseline", required=True, help="Path to baseline JSON")
@@ -297,7 +304,7 @@ def main(argv=None):
         with open(args.output, "w", encoding="utf-8") as f:
             f.write(graph.to_json())
     else:
-        print(graph.to_json())
+        _sys.stdout.write(graph.to_json() + "\n")
 
     return 0
 

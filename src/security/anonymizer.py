@@ -238,6 +238,13 @@ def anonymize_dataframe(df, columns=None):
 
 
 def main(argv=None):
+    # Force stdout/stderr to UTF-8 on Windows
+    import sys as _sys
+    if hasattr(_sys.stdout, "reconfigure"):
+        _sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(_sys.stderr, "reconfigure"):
+        _sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
     import argparse
     p = argparse.ArgumentParser(description="Anonymizer — Auto-anonymize PII in datasets")
     p.add_argument("input",    help="Dataset file path (CSV/JSON/XLSX)")
@@ -246,8 +253,8 @@ def main(argv=None):
     args = p.parse_args(argv)
 
     def emit_error(msg: str) -> int:
-        print(json.dumps({"status": "error", "error": msg, "cells_anonymized": 0,
-                          "anonymized_columns": [], "rules_applied": {}}))
+        _sys.stdout.write(json.dumps({"status": "error", "error": msg, "cells_anonymized": 0,
+                                      "anonymized_columns": [], "rules_applied": {}}) + "\n")
         return 1
 
     if pd is None:
@@ -291,7 +298,7 @@ def main(argv=None):
     except Exception as e:
         return emit_error(f"Failed to write output: {e}")
 
-    print(json.dumps({
+    _sys.stdout.write(json.dumps({
         "status":             "success",
         "input_path":         args.input,
         "output_path":        args.output,
@@ -301,7 +308,7 @@ def main(argv=None):
         "cells_anonymized":   report["cells_anonymized"],
         "rules_applied":      report["rules_applied"],
         "error":              None,
-    }, ensure_ascii=False))
+    }, ensure_ascii=False) + "\n")
     return 0
 
 
