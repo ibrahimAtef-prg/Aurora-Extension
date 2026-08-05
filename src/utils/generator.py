@@ -199,6 +199,127 @@ def _load_synthetic_policy(dataset_path: str) -> Dict[str, Any]:
 
 
 # ==================================================================
+# Shared statistical helpers
+#
+# Consolidated here because two or more fixes in the improvement
+# roadmap independently called for the same statistical pattern
+# (adaptive bin count from cardinality; empirical-Bayes shrinkage of
+# a frequency table toward a reference distribution). Rather than
+# implement each occurrence as its own inline copy, both call sites
+# share one implementation so there is exactly one place that
+# encodes each statistical rule.
+# ==================================================================
+
+def _adaptive_bin_count(
+    n_valid: int,
+    cardinality: int,
+    min_per_cell: int = 5,
+    lo: int = 3,
+    hi: int = 10,
+) -> int:
+    """
+    Adaptive bin/stratum count so each (bin, category) contingency
+    cell has roughly `min_per_cell` expected observations (Scott,
+    1979 bin-count heuristic). Used by:
+      - FIX-04: conditional categorical bin count in _build_cat_tables
+      - FIX-15: regression target bin count in build_class_stats
+    """
+    return max(lo, min(hi, int(n_valid / max(1, cardinality * min_per_cell))))
+
+
+def _shrink_freq_table(
+    obs_freq: Dict[str, float],
+    ref_freq: Dict[str, float],
+    n_obs: int,
+    k_scale: float = 2.0,
+) -> Dict[str, float]:
+    """
+    Empirical-Bayes shrinkage of an observed frequency table toward a
+    reference (e.g. global/unconditional) frequency table, with the
+    shrinkage strength scaling with the number of distinct categories
+    (Good, 1965; Agresti, 2013). Used by:
+      - FIX-02: per-stratum categorical frequencies (build_class_stats)
+      - FIX-14: per-bin conditional frequencies (_build_cat_tables,
+        single-partner case)
+      - FIX-07: per-joint-bin conditional frequencies (_build_cat_tables,
+        multi-partner case)
+
+    `k_scale` controls the pseudo-count multiplier per category
+    (k_shrink = max(1, n_cats / 5) * k_scale); callers use different
+    k_scale values to match their originally-approved formulas
+    (10 for per-bin conditional tables, 2 for per-stratum tables).
+    """
+    all_cats = set(obs_freq) | set(ref_freq)
+    if not all_cats:
+        return {}
+    k_shrink = max(1, len(all_cats) / 5) * k_scale
+    alpha = n_obs / (n_obs + k_shrink)
+    smoothed = {
+        cat: alpha * obs_freq.get(cat, 0.0) + (1 - alpha) * ref_freq.get(cat, 0.0)
+        for cat in all_cats
+    }
+    total = sum(smoothed.values())
+    if total > 0:
+        smoothed = {c: v / total for c, v in smoothed.items()}
+    return smoothed
+
+
+def _apply_null_masks(
+    bl: "BaselineReader",  # type: ignore[name-defined]
+    data: Dict[str, np.ndarray],
+    n: int,
+    rng: np.random.Generator,
+) -> Dict[str, np.ndarray]:
+    """
+    Inject nulls into `data` in place (and return it), used identically by
+    StatisticalEngine.sample() and ProbabilisticEngine.sample() -- this
+    used to be two independent copies of the same loop.
+
+    FIX-08: columns covered by bl.null_corr (populated by
+    build_class_stats(); see there) get correlated nulls via a Gaussian
+    copula instead of independent per-column Bernoulli draws, so e.g.
+    Income and TaxBracket go missing together at roughly the rate seen in
+    the original data. Every other null-bearing column (or all of them,
+    when null_corr is unavailable -- old caches, <2 null columns, or a
+    zero-variance null indicator) falls back to the original independent
+    injection. Null RATES are preserved exactly either way; only the
+    joint missingness PATTERN changes.
+    """
+    correlated_cols = set(bl.null_cols) if bl.null_corr is not None else set()
+
+    if correlated_cols:
+        from scipy.special import ndtri  # type: ignore  # local import, matches existing style
+
+        cov = bl.null_corr
+        z = rng.multivariate_normal(np.zeros(len(bl.null_cols)), cov, size=n)
+        for i, col in enumerate(bl.null_cols):
+            if col not in data:
+                continue
+            nr = bl.null_ratio(col)
+            if nr <= 0.0:
+                continue
+            # Clip away from 0/1 so ndtri never sees ±inf for a
+            # near-certain or near-impossible null rate.
+            threshold = ndtri(min(max(nr, 1e-9), 1 - 1e-9))
+            null_mask = z[:, i] < threshold
+            arr = data[col].astype(object)
+            arr[null_mask] = None
+            data[col] = arr
+
+    for col in bl.col_order:
+        if col in correlated_cols:
+            continue  # already handled above via the copula
+        nr = bl.null_ratio(col)
+        if nr > 0.0 and col in data:
+            null_mask = rng.random(n) < nr
+            arr = data[col].astype(object)
+            arr[null_mask] = None
+            data[col] = arr
+
+    return data
+
+
+# ==================================================================
 # Section 1 — BaselineReader
 # Read and normalise the BaselineArtifact JSON into plain dicts
 # so every engine works with simple Python types, not nested
@@ -322,6 +443,14 @@ class BaselineReader:
         # Per-class covariance matrices populated by build_class_stats()
         # col_group → label_value → (mean_vec, cov_matrix, col_names)
         self.class_covariance: Dict[str, Tuple[np.ndarray, np.ndarray, List[str]]] = {}
+
+        # FIX-08: cross-column null-correlation matrix, also populated by
+        # build_class_stats() (see there for why it lives in the same
+        # method despite not being class-conditional). None until
+        # build_class_stats() runs; null_cols gives the column order
+        # matching null_corr's rows/columns.
+        self.null_corr: Optional[np.ndarray] = None
+        self.null_cols: List[str] = []
 
         # Fix 3: regression-aware conditional target draw
         # The single categorical column most strongly correlated with the
@@ -498,10 +627,45 @@ class BaselineReader:
             self.class_cat_stats
             self.class_covariance
 
+        Also computes (FIX-08), regardless of label_col: the cross-column
+        null-correlation matrix used by correlated null injection at
+        sample time. This lives here rather than in a new orchestration
+        stage because build_class_stats() is already the one existing
+        fitting pass that (a) is called unconditionally by
+        ProbabilisticEngine.fit() and (b) receives the raw df needed to
+        measure null co-occurrence — reusing it avoids a second df-walk
+        and a second cache object for what is fundamentally the same
+        "derive dataset-level statistics from df" step.
+        Populates:
+            self.null_corr
+            self.null_cols
+
         Safe to call multiple times; results are overwritten.
         Requires pandas to be imported (guaranteed by the engine that calls it).
         """
         import pandas as _pd  # local import to avoid top-level hard dep
+
+        # FIX-08: null correlation is a whole-dataset property (unlike the
+        # class-conditional stats below), so it must not be skipped when
+        # there's no label column -- computed before the label_col guard.
+        null_cols = [c for c in self.col_order if self.null_ratio(c) > 0.01 and c in df.columns]
+        if len(null_cols) >= 2:
+            null_indicators = df[null_cols].isna().astype(float)
+            corr = null_indicators.corr().values
+            if not np.any(np.isnan(corr)):
+                self.null_corr = _nearest_pd(corr)
+                self.null_cols = null_cols
+            else:
+                # A column with zero variance in its null indicator (e.g.
+                # null_ratio computed from stale baseline stats but no
+                # actual nulls in this df) produces NaN correlations;
+                # fall back to independent injection rather than risk a
+                # singular/garbage copula.
+                self.null_corr = None
+                self.null_cols = []
+        else:
+            self.null_corr = None
+            self.null_cols = []
 
         if not self.label_col or self.label_col not in df.columns:
             return
@@ -513,10 +677,22 @@ class BaselineReader:
         # stored in self.regression_bin_edges for later inverse-mapping.
         if self.target_type == "regression":
             target_series = pd.to_numeric(df[self.label_col], errors="coerce")
+            # FIX-15: the minimum rows-per-bin threshold (was a fixed 30)
+            # now scales with the widest categorical column's cardinality,
+            # so each (regression bin x category) contingency cell still
+            # gets ~5 expected observations on average -- a fixed 30-row
+            # floor was fine for low-cardinality categoricals but marginal
+            # once a column has 10+ categories.
+            max_cardinality = max(
+                (len(spec.get("all_value_ratios") or spec.get("top_value_ratios") or {})
+                 for spec in self.categorical.values()),
+                default=1,
+            )
+            min_per_bin = max(30, max_cardinality * 5)
             n_bins = min(10, max(3, len(df) // 100))
             while n_bins > 3:
                 trial = pd.qcut(target_series, q=n_bins, labels=False, duplicates="drop")
-                if trial.value_counts().min() >= 30:
+                if trial.value_counts().min() >= min_per_bin:
                     break
                 n_bins -= 1
             bins, edges = pd.qcut(target_series, q=n_bins, labels=False, retbins=True, duplicates="drop")
@@ -594,20 +770,23 @@ class BaselineReader:
                 vc = s.value_counts(normalize=True).to_dict()
                 global_freq = global_cat_freq.get(col, {})
 
-                k = (self.CAT_SHRINKAGE_K_REGRESSION
-                     if self.target_type == "regression"
-                     else self.CAT_SHRINKAGE_K)
-                alpha = n_sub_col / (n_sub_col + k)
-                all_cats = set(vc.keys()) | set(global_freq.keys())
-                smoothed = {
-                    cat: alpha * vc.get(cat, 0.0) + (1 - alpha) * global_freq.get(cat, 0.0)
-                    for cat in all_cats
-                }
-                # Renormalize (alpha-blend of two distributions already sums
-                # to ~1, but guard against float drift)
-                total = sum(smoothed.values())
-                if total > 0:
-                    smoothed = {k: v / total for k, v in smoothed.items()}
+                # FIX-02: scale the shrinkage constant by the number of
+                # categories in this column instead of using a single
+                # global K for every column. A 50-category column needs
+                # much heavier shrinkage than a 3-category column at the
+                # same stratum sample size, since effective samples per
+                # category (n/k) is what actually governs estimator noise
+                # (Good, 1965; Agresti, 2013).
+                #
+                # Uses the shared _shrink_freq_table helper (see module-
+                # level docstring) so this formula and FIX-14's per-bin
+                # shrinkage share one implementation. The original formula
+                # was k = k_base * max(1, n_cats/5), which is exactly
+                # _shrink_freq_table's k_shrink with k_scale = k_base.
+                k_base = (self.CAT_SHRINKAGE_K_REGRESSION
+                          if self.target_type == "regression"
+                          else self.CAT_SHRINKAGE_K)
+                smoothed = _shrink_freq_table(vc, global_freq, n_sub_col, k_scale=k_base)
 
                 entry = self.class_cat_stats.setdefault(col, {})
                 entry[self._norm_lv(lv)] = smoothed
@@ -682,6 +861,18 @@ class BaselineReader:
                     continue
                 mu  = sub.mean().values
                 cov = sub.cov().values
+                # FIX-12: shrink the sample covariance toward a scaled
+                # identity matrix before the nearest-PD projection. The raw
+                # sample covariance is highly noisy for small strata
+                # (n_sub < 50 with 10+ numeric columns); _nearest_pd alone
+                # only forces positive-definiteness, it doesn't reduce that
+                # noise. Ledoit & Wolf (2004) shrinkage dominates the
+                # sample covariance in MSE whenever p/n > 0.1.
+                n_sub_cov   = len(sub)
+                k_cols      = len(num_cols)
+                trace_cov   = np.trace(cov) / k_cols
+                shrink_alpha = min(1.0, k_cols / max(1, n_sub_cov - k_cols - 1))
+                cov = (1 - shrink_alpha) * cov + shrink_alpha * trace_cov * np.eye(k_cols)
                 cov = _nearest_pd(cov)
                 self.class_covariance[self._norm_lv(lv)] = (mu, cov, num_cols)
 
@@ -787,7 +978,7 @@ class StatisticalEngine:
                     # Fix B: helper — draw from global column CDF clipped to
                     # [lo, hi] instead of flat uniform; preserves within-bin
                     # distributional shape (tail skew, median, IQR).
-                    def _cdf_fallback_stat(n_draw: int) -> np.ndarray:
+                    def _cdf_fallback_stat(n_draw: int, lo=lo, hi=hi) -> np.ndarray:
                         col_spec = bl.numeric.get(bl.label_col, {})
                         fb_lvls, fb_vals = _build_quantile_cdf(col_spec)
                         if fb_lvls is not None and fb_vals[0] != fb_vals[-1]:
@@ -878,14 +1069,10 @@ class StatisticalEngine:
         for col in bl.other:
             data[col] = np.array([None] * n, dtype=object)
 
-        # Apply null masks
-        for col in bl.col_order:
-            nr = bl.null_ratio(col)
-            if nr > 0.0 and col in data:
-                null_mask = rng.random(n) < nr
-                arr = data[col].astype(object)
-                arr[null_mask] = None
-                data[col] = arr
+        # Apply null masks (FIX-08: correlated where bl.null_corr is
+        # available, independent Bernoulli fallback otherwise; shared
+        # with ProbabilisticEngine.sample() via _apply_null_masks)
+        data = _apply_null_masks(bl, data, n, rng)
 
         return pd.DataFrame({col: data[col] for col in bl.col_order if col in data})
 
@@ -1061,7 +1248,6 @@ class ProbabilisticEngine:
         self._mu          : Optional[np.ndarray]        = None
         self._cov         : Optional[np.ndarray]        = None
         self._cdfs        : Dict[str, Tuple]            = {}   # col → (sorted_vals, uniform_quantiles)
-        self._enc_cdfs    : Dict[str, Tuple]            = {}   # encoded-cat col → (sorted_vals, uniform_quantiles)
         self._cat_tables  : Dict[str, Dict]             = {}   # col → {bin_label → {value: prob}}
         self._num_cols    : List[str]                   = []
 
@@ -1075,6 +1261,20 @@ class ProbabilisticEngine:
         self._manifest : Optional["PreprocessingManifest"] = manifest
         self._df_orig  : Optional[pd.DataFrame]            = None  # set by fit()
 
+        # Engine-local cached fields (ISSUE 09 fix).
+        # These are populated by fit() or load_cache() and consumed by
+        # sample() and save_cache().  Previously load_cache() wrote these
+        # directly to self.bl, leaking cache state into the shared
+        # BaselineReader object used by other pipeline stages.
+        self._label_col            : Optional[str]               = None
+        self._label_dist           : Optional[Dict[str, float]]  = None
+        self._class_cat_stats      : Dict[str, Dict]             = {}
+        self._class_numeric_stats  : Dict[str, Dict]             = {}
+        self._target_type          : Optional[str]               = None
+        self._regression_bin_edges : Optional[np.ndarray]        = None
+        self._primary_target_cat_col : Optional[str]             = None
+        self._target_cat_quantiles : Dict[Tuple, Dict]           = {}
+
     # ------------------------------------------------------------------
     # Public interface
     # ------------------------------------------------------------------
@@ -1086,6 +1286,17 @@ class ProbabilisticEngine:
         # Build per-class stats on the ORIGINAL df (not copula_df)
         # so class stats use real category values for label-first path.
         bl.build_class_stats(df)
+
+        # Copy baseline-derived fields to engine-local storage (ISSUE 09).
+        # This avoids leaking state back through the shared bl object.
+        self._label_col            = bl.label_col
+        self._label_dist           = bl.label_dist
+        self._class_cat_stats      = bl.class_cat_stats
+        self._class_numeric_stats  = bl.class_numeric_stats
+        self._target_type          = bl.target_type
+        self._regression_bin_edges = bl.regression_bin_edges
+        self._primary_target_cat_col = bl.primary_target_cat_col
+        self._target_cat_quantiles = bl.target_cat_quantiles
 
         # ── If manifest available: fit copula on copula_df ────────────
         if self._manifest is not None:
@@ -1106,18 +1317,41 @@ class ProbabilisticEngine:
             # Encoded categorical columns are kept in the copula to preserve joint
             # structure.  Their Z-scores cluster into K discrete levels (one per
             # category), which can make the covariance matrix near-singular.
-            # Proportional jitter (1 % of the column's std, floored at 1e-4)
-            # smooths the discrete mass without distorting the correlation signal.
-            if self._manifest.encoder is not None:
-                enc_col_set = set(self._manifest.encoder.columns_in_copula)
-                for col in list(self._num_cols):
-                    if col in enc_col_set:
-                        col_std = float(copula_df[col].std()) or 1.0
-                        jitter_scale = max(col_std * 0.01, 1e-4)
-                        noise = self.rng.normal(0.0, jitter_scale, size=len(copula_df))
-                        copula_df = copula_df.copy()
-                        copula_df[col] = copula_df[col] + noise
-                self._enc_cdfs = {}  # no longer used; encoded cols flow through copula
+            #
+            # FIX-10: jitter is now calibrated to 10% of each column's minimum
+            # inter-category gap (via its category_map — which already
+            # reflects FIX-16's James-Stein shrinkage for pb_mean columns, so
+            # the gap measured here is the real post-shrinkage spacing) rather
+            # than a flat 1% of the column's std. A fixed 1% is negligible for
+            # widely-spaced categories but can be 50%+ of the gap for tightly
+            # clustered ones, causing frequent decode mis-snapping.
+            #
+            # Precondition fix: `enc_cols_to_jitter` previously compared
+            # self._num_cols (encoded column names, e.g. "cat__enc") against
+            # enc_col_set (original column names, e.g. "cat") -- these never
+            # matched, so this jitter block silently never ran for any
+            # encoded categorical column. Matching is now done via each
+            # encoding's actual encoded_names, so the block (and FIX-10)
+            # actually executes.
+            if self._manifest.encoder is not None and hasattr(self._manifest.encoder, "_encodings"):
+                encodings_by_encoded_name = {
+                    enc.encoded_names[0]: enc
+                    for enc in self._manifest.encoder._encodings.values()
+                    if enc.strategy != "constant" and enc.encoded_names
+                }
+                enc_cols_to_jitter = [c for c in self._num_cols if c in encodings_by_encoded_name]
+                if enc_cols_to_jitter:
+                    copula_df = copula_df.copy()  # single copy (ISSUE 06 fix)
+                for col in enc_cols_to_jitter:
+                    cat_map = encodings_by_encoded_name[col].category_map
+                    sorted_vals = sorted(cat_map.values())
+                    min_gap = (
+                        min(b - a for a, b in zip(sorted_vals, sorted_vals[1:]))
+                        if len(sorted_vals) > 1 else 1.0
+                    )
+                    jitter_scale = max(min_gap * 0.1, 1e-4)
+                    noise = self.rng.normal(0.0, jitter_scale, size=len(copula_df))
+                    copula_df[col] = copula_df[col] + noise
         else:
             copula_df = df
             self._num_cols = [c for c in bl.numeric
@@ -1197,10 +1431,24 @@ class ProbabilisticEngine:
         U = np.column_stack([
             self._empirical_cdf_transform(df[c]) for c in num_cols
         ])
+
+        # ISSUE 13 fix: exclude rows where ANY copula column is NaN in the
+        # original data.  _empirical_cdf_transform maps NaN → 0.5 (median
+        # quantile), which clusters those rows at Z=0 after probit transform,
+        # inflating the density at the origin and biasing covariance → 0.
+        valid_mask = df[num_cols].notna().all(axis=1).values
+        n_valid = int(valid_mask.sum())
+        # Guard: need at least num_cols+2 valid rows for a non-degenerate
+        # covariance estimate; fall back to all rows (old behaviour) if not.
+        if n_valid >= len(num_cols) + 2:
+            U_fit = U[valid_mask]
+        else:
+            U_fit = U
+
         # Clamp strictly inside (0,1) for the probit transform — this is a
         # mathematical requirement of ndtri, not a data boundary clamp
-        U = np.clip(U, 1e-6, 1.0 - 1e-6)
-        Z = ndtri(U)
+        U_fit = np.clip(U_fit, 1e-6, 1.0 - 1e-6)
+        Z = ndtri(U_fit)
 
         mu  = Z.mean(axis=0)
         cov = np.cov(Z, rowvar=False) if Z.shape[1] > 1 else np.array([[1.0]])
@@ -1214,17 +1462,27 @@ class ProbabilisticEngine:
         bl  = self.bl
         rng = self.rng
 
+        # Engine-local aliases for cached fields (ISSUE 09 fix).
+        # These may differ from bl.* when loaded from cache.
+        label_col   = self._label_col
+        label_dist  = self._label_dist
+        target_type = self._target_type
+        reg_edges   = self._regression_bin_edges
+        pcol_name   = self._primary_target_cat_col
+        ccs         = self._class_cat_stats
+        tcq         = self._target_cat_quantiles
+
         data: Dict[str, np.ndarray] = {}
 
-        if bl.label_col and bl.label_dist and self._class_copulas:
+        if label_col and label_dist and self._class_copulas:
             # ---- Label-first path ----
-            label_choices = list(bl.label_dist.keys())
-            label_probs   = np.array(list(bl.label_dist.values()), dtype=float)
+            label_choices = list(label_dist.keys())
+            label_probs   = np.array(list(label_dist.values()), dtype=float)
             label_probs   = label_probs / label_probs.sum()
             labels        = np.array(label_choices, dtype=object)[
                 rng.choice(len(label_choices), size=n, p=label_probs)
             ]
-            data[bl.label_col] = labels
+            data[label_col] = labels
 
             # Fix 3: tracks whether primary_target_cat_col was pre-sampled
             # inside the regression block below. Initialized here so the
@@ -1234,9 +1492,9 @@ class ProbabilisticEngine:
             # Regression target: emit an actual continuous value conditioned on
             # the strongest-correlated categorical column when available (Fix 3).
             # Falls back to flat rng.uniform(lo, hi) per stratum otherwise.
-            if bl.target_type == "regression" and bl.regression_bin_edges is not None:
-                edges = bl.regression_bin_edges
-                pcol  = bl.primary_target_cat_col
+            if target_type == "regression" and reg_edges is not None:
+                edges = reg_edges
+                pcol  = pcol_name
                 target_arr = np.empty(n, dtype=float)
 
                 # Sample the primary categorical column early so target draw
@@ -1247,7 +1505,7 @@ class ProbabilisticEngine:
                         idxs = np.where(labels == lv)[0]
                         if len(idxs) == 0:
                             continue
-                        cls_freq = bl.class_cat_stats.get(pcol, {}).get(bl._norm_lv(lv))
+                        cls_freq = ccs.get(pcol, {}).get(bl._norm_lv(lv))
                         if cls_freq:
                             ch  = list(cls_freq.keys())
                             wts = np.array(list(cls_freq.values()), dtype=float)
@@ -1273,8 +1531,8 @@ class ProbabilisticEngine:
                     # Fix B: helper — draw from global column CDF clipped to
                     # [lo, hi] instead of flat uniform; preserves within-bin
                     # distributional shape (tail skew, median, IQR).
-                    def _cdf_fallback_prob(n_draw: int) -> np.ndarray:
-                        col_spec = bl.numeric.get(bl.label_col, {})
+                    def _cdf_fallback_prob(n_draw: int, lo=lo, hi=hi) -> np.ndarray:
+                        col_spec = bl.numeric.get(label_col, {})
                         fb_lvls, fb_vals = _build_quantile_cdf(col_spec)
                         if fb_lvls is not None and fb_vals[0] != fb_vals[-1]:
                             return np.clip(
@@ -1290,7 +1548,7 @@ class ProbabilisticEngine:
                     cats_here = primary_col_values[mask]
                     for cat in np.unique(cats_here):
                         sub_idx = mask[cats_here == cat]
-                        profile = bl.target_cat_quantiles.get((bl._norm_lv(lv), str(cat)))
+                        profile = tcq.get((bl._norm_lv(lv), str(cat)))
                         if profile is None:
                             target_arr[sub_idx] = _cdf_fallback_prob(len(sub_idx))
                             continue
@@ -1301,7 +1559,7 @@ class ProbabilisticEngine:
                         drawn = _quantile_cdf_sample(len(sub_idx), levels, values, rng)
                         target_arr[sub_idx] = np.clip(drawn, lo, hi)
 
-                data[bl.label_col] = target_arr
+                data[label_col] = target_arr
 
             # Initialise numeric arrays to 0.0 — np.empty leaves uninitialized
             # memory that can be NaN on some platforms, causing NO_NAN violations
@@ -1389,11 +1647,11 @@ class ProbabilisticEngine:
 
             # Sample categorical features conditioned on label
             for col, spec in bl.categorical.items():
-                if col == bl.label_col:
+                if col == label_col:
                     continue
                 # Fix 3: primary categorical already sampled above (conditioned
                 # jointly with the regression target) — don't overwrite it.
-                if col == bl.primary_target_cat_col and primary_col_values is not None:
+                if col == pcol_name and primary_col_values is not None:
                     continue
                 arr = np.empty(n, dtype=object)
                 for lv in label_choices:
@@ -1401,7 +1659,7 @@ class ProbabilisticEngine:
                     n_lv = len(mask)
                     if n_lv == 0:
                         continue
-                    cls_freq = bl.class_cat_stats.get(col, {}).get(bl._norm_lv(lv))
+                    cls_freq = ccs.get(col, {}).get(bl._norm_lv(lv))
                     if cls_freq:
                         ch  = list(cls_freq.keys())
                         wts = np.array(list(cls_freq.values()), dtype=float)
@@ -1415,10 +1673,6 @@ class ProbabilisticEngine:
                             col, spec, data, n_lv
                         )
                 data[col] = arr
-
-            # Other columns (must be populated before null mask loop)
-            for col in bl.other:
-                data[col] = np.array([None] * n, dtype=object)
 
         else:
             # ---- Unlabelled path ----
@@ -1453,14 +1707,14 @@ class ProbabilisticEngine:
             copula_output = pd.DataFrame(
                 {col: data[col] for col in self._num_cols if col in data}
             )
-            if (bl.target_type == "regression" and bl.label_col
-                    and bl.label_col in data
-                    and bl.label_col not in copula_output.columns):
+            if (target_type == "regression" and label_col
+                    and label_col in data
+                    and label_col not in copula_output.columns):
                 # Target was excluded from self._num_cols (sampled separately
                 # by stratum above) — the manifest still treats it as a copula
                 # column though, so merge_outputs() expects to find it among
                 # copula_output's columns or it will raise ColumnMergeError.
-                copula_output[bl.label_col] = data[bl.label_col]
+                copula_output[label_col] = data[label_col]
             _, excluded_df = apply_manifest(
                 self._manifest, self._df_orig, n, self.rng
             )
@@ -1470,14 +1724,9 @@ class ProbabilisticEngine:
             )
 
         # ── Legacy path (no manifest) ─────────────────────────────────
-        # Null masks
-        for col in bl.col_order:
-            nr = bl.null_ratio(col)
-            if nr > 0.0 and col in data:
-                null_mask = rng.random(n) < nr
-                arr = data[col].astype(object)
-                arr[null_mask] = None
-                data[col] = arr
+        # Null masks (FIX-08: correlated where available, see
+        # _apply_null_masks / StatisticalEngine.sample())
+        data = _apply_null_masks(bl, data, n, rng)
 
         return pd.DataFrame({col: data[col] for col in bl.col_order if col in data})
 
@@ -1521,25 +1770,24 @@ class ProbabilisticEngine:
             "mu":                  self._mu,
             "cov":                 self._cov,
             "cdfs":                self._cdfs,
-            "enc_cdfs":            self._enc_cdfs,
             "cat_tables":          self._cat_tables,
             "num_cols":            self._num_cols,
             "class_copulas":       self._class_copulas,
-            "label_col":           self.bl.label_col,
-            "label_dist":          self.bl.label_dist,
-            "class_cat_stats":     self.bl.class_cat_stats,
-            "class_numeric_stats": self.bl.class_numeric_stats,
+            "label_col":           self._label_col,
+            "label_dist":          self._label_dist,
+            "class_cat_stats":     self._class_cat_stats,
+            "class_numeric_stats": self._class_numeric_stats,
             "manifest_col_hash":   manifest_sig,
-            "target_type":         self.bl.target_type,
+            "target_type":         self._target_type,
             "regression_bin_edges": (
-                self.bl.regression_bin_edges.tolist()
-                if self.bl.regression_bin_edges is not None else None
+                self._regression_bin_edges.tolist()
+                if self._regression_bin_edges is not None else None
             ),
             # Fix 3: conditional regression target draw
-            "primary_target_cat_col": self.bl.primary_target_cat_col,
+            "primary_target_cat_col": self._primary_target_cat_col,
             "target_cat_quantiles": {
                 f"{lv}||{cat}": profile
-                for (lv, cat), profile in self.bl.target_cat_quantiles.items()
+                for (lv, cat), profile in self._target_cat_quantiles.items()
             },
         }
         safe_dump(payload, p, cache_dir=self.cache_dir)
@@ -1578,24 +1826,24 @@ class ProbabilisticEngine:
             self._mu            = payload["mu"]
             self._cov           = payload["cov"]
             self._cdfs          = payload["cdfs"]
-            self._enc_cdfs      = payload.get("enc_cdfs", {})
             self._cat_tables    = payload["cat_tables"]
             self._num_cols      = payload["num_cols"]
             self._class_copulas = payload.get("class_copulas", {})
+            # Write to engine-local fields — NOT to self.bl (ISSUE 09 fix).
             if payload.get("label_col"):
-                self.bl.label_col           = payload["label_col"]
-                self.bl.label_dist          = payload.get("label_dist", {})
-                self.bl.class_cat_stats     = payload.get("class_cat_stats", {})
-                self.bl.class_numeric_stats = payload.get("class_numeric_stats", {})
+                self._label_col            = payload["label_col"]
+                self._label_dist           = payload.get("label_dist", {})
+                self._class_cat_stats      = payload.get("class_cat_stats", {})
+                self._class_numeric_stats  = payload.get("class_numeric_stats", {})
             if payload.get("target_type"):
-                self.bl.target_type = payload["target_type"]
+                self._target_type = payload["target_type"]
             _edges = payload.get("regression_bin_edges")
             if _edges is not None:
-                self.bl.regression_bin_edges = np.array(_edges)
+                self._regression_bin_edges = np.array(_edges)
             # Fix 3: restore conditional regression target draw state
-            self.bl.primary_target_cat_col = payload.get("primary_target_cat_col")
+            self._primary_target_cat_col = payload.get("primary_target_cat_col")
             _tcq = payload.get("target_cat_quantiles", {})
-            self.bl.target_cat_quantiles = {
+            self._target_cat_quantiles = {
                 tuple(k.split("||", 1)): v for k, v in _tcq.items()
             }
             self._fitted        = True
@@ -1649,18 +1897,53 @@ class ProbabilisticEngine:
                 if num_col in df.columns:
                     num_series = pd.to_numeric(df[num_col], errors="coerce")
                     cat_series = df[col].astype(str)
-                    bins       = pd.qcut(num_series, q=4, labels=False, duplicates="drop")
+                    # FIX-04: adaptive bin count instead of a fixed q=4,
+                    # via the shared _adaptive_bin_count helper (see
+                    # module-level docstring; also used by FIX-15's
+                    # regression target binning). Too few bins wastes
+                    # resolution on large datasets; too many starves small
+                    # ones of rows per contingency cell.
+                    n_valid = int(num_series.dropna().count())
+                    n_cats  = len(cat_series.dropna().unique())
+                    q = _adaptive_bin_count(n_valid, n_cats)
+                    # FIX-01: retain the qcut bin edges so sampling can use
+                    # np.digitize with the SAME edges (equal-count quantile
+                    # boundaries) instead of a linear (equal-width) rescale,
+                    # which silently mismatched for skewed partners.
+                    bins, edges = pd.qcut(
+                        num_series, q=q, labels=False, duplicates="drop", retbins=True
+                    )
                     table: Dict[str, Dict[str, float]] = {}
+                    # FIX-14: shrink each per-bin frequency table toward the
+                    # column's global (unconditional) frequency, using the
+                    # shared _shrink_freq_table helper (same empirical-Bayes
+                    # scheme as FIX-02's build_class_stats; k_scale=10
+                    # matches the originally-approved per-bin formula
+                    # k_shrink = max(1, n_cats/5) * 10). Raw per-bin MLE
+                    # frequencies give unseen categories P=0 in that bin --
+                    # they can then never be generated for numeric values in
+                    # that range, even though they exist elsewhere in the
+                    # column.
+                    global_freq = cat_series.value_counts(normalize=True).to_dict()
                     for bin_label in bins.dropna().unique():
-                        mask    = bins == bin_label
-                        sub     = cat_series[mask]
-                        vc      = sub.value_counts(normalize=True)
-                        table[str(int(bin_label))] = vc.to_dict()
-                    tables[col] = {"type": "conditional", "partner": num_col, "bins": table}
+                        mask  = bins == bin_label
+                        sub   = cat_series[mask]
+                        vc    = sub.value_counts(normalize=True).to_dict()
+                        table[str(int(bin_label))] = _shrink_freq_table(
+                            vc, global_freq, len(sub), k_scale=10
+                        )
+                    tables[col] = {
+                        "type": "conditional",
+                        "partner": num_col,
+                        "bins": table,
+                        "edges": edges.tolist(),  # FIX-01
+                    }
                     continue
 
             # Unconditional frequency table
-            ratios = spec.get("top_value_ratios") or {}
+            # FIX-03: prefer full-distribution ratios over the truncated
+            # top-10 table so long-tail categories aren't silently dropped.
+            ratios = spec.get("all_value_ratios") or spec.get("top_value_ratios") or {}
             tables[col] = {"type": "unconditional", "ratios": ratios}
 
         return tables
@@ -1681,7 +1964,7 @@ class ProbabilisticEngine:
         table = self._cat_tables.get(col)
 
         if table is None or table["type"] == "unconditional":
-            ratios  = spec.get("top_value_ratios") or {}
+            ratios  = spec.get("all_value_ratios") or spec.get("top_value_ratios") or {}
             if not ratios:
                 return np.array([None] * n, dtype=object)
             choices = list(ratios.keys())
@@ -1696,7 +1979,7 @@ class ProbabilisticEngine:
 
         if partner_arr is None or len(bins_table) == 0:
             # Fall back to unconditional
-            ratios  = spec.get("top_value_ratios") or {}
+            ratios  = spec.get("all_value_ratios") or spec.get("top_value_ratios") or {}
             choices = list(ratios.keys()) if ratios else [None]
             weights = np.array(list(ratios.values()), dtype=float) if ratios else np.array([1.0])
             weights = weights / weights.sum()
@@ -1712,17 +1995,31 @@ class ProbabilisticEngine:
         bin_keys  = sorted(bins_table.keys(), key=lambda x: int(x))
         n_bins    = len(bin_keys)
 
-        # G9 fix: vectorized bin assignment.
         # partner_arr is a float array, so use np.isnan not == None.
         partner_float = partner_arr.astype(float)
         nan_mask      = np.isnan(partner_float)
         vals          = np.where(nan_mask, lo, partner_float)
-        bin_indices   = np.clip(
-            ((vals - lo) / rng_span * n_bins).astype(int), 0, n_bins - 1
-        )
+
+        # FIX-01: use the qcut bin edges saved at fit time (np.digitize)
+        # instead of a linear/equal-width rescale, which mismatched the
+        # equal-count quantile bins used to build `bins_table` and biased
+        # every conditional probability for skewed numeric partners.
+        # Old caches without "edges" fall back to the previous linear
+        # rescale for backward compatibility.
+        edges = np.array(table.get("edges", []))
+        if len(edges) > 1:
+            # Interior edges only (drop the outer min/max boundaries);
+            # np.digitize then returns values in [0, n_bins - 1].
+            bin_indices = np.clip(np.digitize(vals, edges[1:-1]), 0, n_bins - 1)
+        else:
+            bin_indices = np.clip(
+                ((vals - lo) / rng_span * n_bins).astype(int), 0, n_bins - 1
+            )
 
         # Global marginal fallback (for empty conditional bins)
-        ratios_fb = spec.get("top_value_ratios") or {}
+        # FIX-03: prefer full-distribution ratios over the truncated
+        # top-10 table so long-tail categories aren't silently dropped.
+        ratios_fb = spec.get("all_value_ratios") or spec.get("top_value_ratios") or {}
         fb_choices = list(ratios_fb.keys()) if ratios_fb else []
         fb_weights = (np.array(list(ratios_fb.values()), dtype=float)
                       if ratios_fb else np.array([]))
@@ -1800,6 +2097,8 @@ class CTGANEngine:
             if not self._fallback.load_cache():
                 self._fallback.fit(df)
                 self._fallback.save_cache()
+            else:
+                self._fallback._df_orig = df  # Restore for manifest path on cache hit
             self._fitted = True
             return
 
@@ -2109,14 +2408,18 @@ def _generate_inner(
 
     # ════════════════════════════════════════════════════════════════
     # Build preprocessing manifest (6-type taxonomy + CategoricalEncoder)
+    # Only for engines that consume it (ProbabilisticEngine, CTGANEngine).
+    # StatisticalEngine does not accept a manifest — skip wasted work.
     # ════════════════════════════════════════════════════════════════
-    manifest = build_manifest(
-        df_orig, artifact, overrides=synthetic_policy,
-        target_type=bl.target_type, target_col=bl.label_col,
-    )
-    if manifest.warnings:
-        for _w in manifest.warnings:
-            output_warnings.append(f"[preprocessing] {_w}")
+    manifest = None
+    if engine_name != StatisticalEngine.ENGINE_NAME:
+        manifest = build_manifest(
+            df_orig, artifact, overrides=synthetic_policy,
+            target_type=bl.target_type, target_col=bl.label_col,
+        )
+        if manifest.warnings:
+            for _w in manifest.warnings:
+                output_warnings.append(f"[preprocessing] {_w}")
 
     # ════════════════════════════════════════════════════════════════
     # Build and train engine
@@ -2124,9 +2427,14 @@ def _generate_inner(
     with logger.stage("engine_build") as ctx_eng:
         if engine_name == StatisticalEngine.ENGINE_NAME:
             engine = StatisticalEngine(bl, _seed_mgr.spawn(root_rng, "statistical"))
-            if bl.label_col:
-                try:
-                    bl.build_class_stats(df_orig)
+            # FIX-08: build_class_stats() also computes the cross-column
+            # null-correlation matrix, which (unlike class-conditional
+            # stats) is a whole-dataset property independent of label_col.
+            # The call itself therefore now runs unconditionally; only the
+            # label-specific warnings/sanity-checks below remain gated.
+            try:
+                bl.build_class_stats(df_orig)
+                if bl.label_col:
                     output_warnings.append(
                         f"Label column detected (\'{bl.label_col}\'): "
                         "class-conditional statistics built for label-first generation."
@@ -2155,11 +2463,11 @@ def _generate_inner(
                                     f"not be taking effect (expected strong skew for "
                                     f"primary_target_cat_col by definition)."
                                 )
-                except Exception as e:
-                    output_warnings.append(
-                        f"Could not build class stats "
-                        f"(falling back to marginal distributions): {e}"
-                    )
+            except Exception as e:
+                output_warnings.append(
+                    f"Could not build class stats "
+                    f"(falling back to marginal distributions): {e}"
+                )
             actual_engine = StatisticalEngine.ENGINE_NAME
 
         elif engine_name == ProbabilisticEngine.ENGINE_NAME:
@@ -2201,6 +2509,7 @@ def _generate_inner(
                                 f"primary_target_cat_col by definition)."
                             )
             else:
+                engine._df_orig = df_orig  # Restore for manifest path on cache hit
                 output_warnings.append("Probabilistic model loaded from cache.")
             actual_engine = ProbabilisticEngine.ENGINE_NAME
 
@@ -2214,6 +2523,10 @@ def _generate_inner(
                 engine.save_cache()
                 output_warnings.append("CTGAN model fitted and cached.")
             else:
+                engine._df_orig = df_orig  # Restore for manifest path on cache hit
+                # Also restore on fallback ProbabilisticEngine if present
+                if engine._fallback is not None:
+                    engine._fallback._df_orig = df_orig
                 output_warnings.append("CTGAN model loaded from cache.")
             actual_engine = engine.engine_used
             if actual_engine != CTGANEngine.ENGINE_NAME:
@@ -2759,9 +3072,25 @@ def _quantile_cdf_sample(
     • 100% acceptance rate — no rejection loop
     • Output is naturally bounded within [values[0], values[-1]]
     • Preserves the full distribution shape encoded in the quantile points
+
+    FIX-13: adds small uniform jitter proportional to the local segment
+    width. With only ~9 quantile knots (min, q01, q05, q25, q50, q75, q95,
+    q99, max), the piecewise-linear interpolation alone produces a visible
+    "staircase" -- values cluster at knot points. The jitter is scaled to
+    10% of the local segment width so it never pushes a value into a
+    neighboring segment's density regime, and the result is clipped back
+    into [values[0], values[-1]] to preserve the bounded-output guarantee.
     """
     u = rng.uniform(0.0, 1.0, size=n)
-    return np.interp(u, levels, values)
+    raw = np.interp(u, levels, values)
+    if len(values) < 2:
+        # Degenerate case (e.g. an all-identical-value column): no segments
+        # to jitter within, and jittering would divide by an empty diff.
+        return raw
+    seg_indices = np.clip(np.searchsorted(levels, u) - 1, 0, len(levels) - 2)
+    seg_widths = np.diff(values)
+    jitter = rng.uniform(-0.5, 0.5, size=n) * seg_widths[seg_indices] * 0.1
+    return np.clip(raw + jitter, values[0], values[-1])
 
 def _resample_out_of_range(
     arr:  np.ndarray,
@@ -2982,10 +3311,16 @@ def _erfcinv(y: np.ndarray) -> np.ndarray:
 def _sanitize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     if df is None:
         return df
+    # ISSUE 19 fix: copy before mutating to avoid modifying the caller's
+    # DataFrame when it holds a reference to the same object.
+    needs_copy = True
     for col in df.columns:
         if df[col].dtype == object or df[col].dtype == 'O':
             has_unhashable = df[col].dropna().apply(lambda x: isinstance(x, (list, dict, set))).any()
             if has_unhashable:
+                if needs_copy:
+                    df = df.copy()
+                    needs_copy = False
                 df[col] = df[col].apply(lambda x: json.dumps(x, ensure_ascii=False) if isinstance(x, (list, dict, set)) else x)
     return df
 

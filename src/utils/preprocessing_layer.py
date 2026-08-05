@@ -137,6 +137,8 @@ class ColumnManifest:
     _id_start:     Optional[int]              = field(default=None, repr=False)
     # Latent matrix cache for FREE_TEXT Strategy A
     _latent_matrix: Optional[Any]             = field(default=None, repr=False)
+    # Pre-fitted NearestNeighbors model for FREE_TEXT Strategy A (ISSUE 11 fix)
+    _nn_model:     Optional[Any]              = field(default=None, repr=False)
     # D1: DATETIME range and format
     _dt_min:       Optional[str]              = field(default=None, repr=False)  # ISO timestamp
     _dt_max:       Optional[str]              = field(default=None, repr=False)  # ISO timestamp
@@ -195,6 +197,11 @@ _PATTERN_TEMPLATES: List[Tuple[str, str]] = [
     ("iso_date",    r'^\d{4}-\d{2}-\d{2}'),
     ("hash_hex",    r'^[a-f0-9]{32,}$'),
     ("hash_b64",    r'^[A-Za-z0-9+/]{20,}={0,2}$'),
+]
+
+# Pre-compiled regex patterns (ISSUE 17 fix: compiled once at module import)
+_COMPILED_PATTERN_TEMPLATES: List[Tuple[str, str, re.Pattern]] = [
+    (label, pat, re.compile(pat)) for label, pat in _PATTERN_TEMPLATES
 ]
 
 _UUID_RE = re.compile(
@@ -766,7 +773,7 @@ def _classify_column(
     if is_object and unique_ratio > 0.70 and n_valid > 0:
         avg_tokens = float(non_null.astype(str).str.split().str.len().mean())
         if avg_tokens > 3:
-            tfidf, svd, pool, latent = _fit_freetext_model(non_null)
+            tfidf, svd, pool, latent, nn_model = _fit_freetext_model(non_null)
             cm = ColumnManifest(
                 **base_kwargs,
                 col_type=ColumnType.FREE_TEXT,
@@ -776,6 +783,7 @@ def _classify_column(
                 value_pool=pool,
             )
             cm._latent_matrix = latent
+            cm._nn_model = nn_model
             cm._orig_dtype = orig_dtype
             return cm
 
@@ -889,8 +897,7 @@ def _is_id_column(
 
         # Exclude patterned data: emails, URLs, dates, etc.
         # These are better handled by HIGH_CARD_CATEGORICAL
-        for _label, pat in _PATTERN_TEMPLATES:
-            compiled = re.compile(pat)
+        for _label, _pat, compiled in _COMPILED_PATTERN_TEMPLATES:
             coverage = float(str_vals.head(200).apply(
                 lambda v: bool(compiled.match(v))
             ).mean())
@@ -974,8 +981,7 @@ def _detect_pattern(series: pd.Series) -> Optional[str]:
     if n_vals == 0:
         return None
 
-    for _label, pattern in _PATTERN_TEMPLATES:
-        compiled = re.compile(pattern)
+    for _label, pattern, compiled in _COMPILED_PATTERN_TEMPLATES:
         matches = str_vals.apply(lambda v: bool(compiled.match(v)))
         coverage = float(matches.mean())
         if coverage > 0.70:
@@ -998,16 +1004,16 @@ def _build_frequency_table(series: pd.Series) -> Dict[str, float]:
 
 def _fit_freetext_model(
     series: pd.Series,
-) -> Tuple[Optional[Any], Optional[Any], List[str], Optional[Any]]:
+) -> Tuple[Optional[Any], Optional[Any], List[str], Optional[Any], Optional[Any]]:
     """
-    Fit TF-IDF + SVD on non-null text values.
-    Returns (tfidf, svd, value_pool, latent_matrix).
-    Falls back to (None, None, pool, None) if sklearn unavailable.
+    Fit TF-IDF + SVD + NearestNeighbors on non-null text values.
+    Returns (tfidf, svd, value_pool, latent_matrix, nn_model).
+    Falls back to (None, None, pool, None, None) if sklearn unavailable.
     """
     pool = series.dropna().astype(str).tolist()
 
     if not _SKLEARN_AVAILABLE or len(pool) < 2:
-        return None, None, pool, None
+        return None, None, pool, None, None
 
     try:
         tfidf = TfidfVectorizer(max_features=200, min_df=1)
@@ -1015,14 +1021,17 @@ def _fit_freetext_model(
 
         n_components = min(20, tfidf_matrix.shape[0] - 1, tfidf_matrix.shape[1])
         if n_components < 1:
-            return None, None, pool, None
+            return None, None, pool, None, None
 
         svd = TruncatedSVD(n_components=n_components)
         latent = svd.fit_transform(tfidf_matrix)
 
-        return tfidf, svd, pool, latent
+        nn = NearestNeighbors(n_neighbors=1, metric="euclidean")
+        nn.fit(latent)
+
+        return tfidf, svd, pool, latent, nn
     except Exception:
-        return None, None, pool, None
+        return None, None, pool, None, None
 
 
 # ==================================================================
@@ -1079,10 +1088,8 @@ def _generate_datetime(
             ts_str = dt_min.strftime(fmt)
             return np.array([ts_str] * n, dtype=object)
         offsets = rng.uniform(0.0, span, size=n)
-        results = np.empty(n, dtype=object)
-        for i, offset in enumerate(offsets):
-            results[i] = (dt_min + pd.Timedelta(seconds=float(offset))).strftime(fmt)
-        return results
+        timestamps = dt_min + pd.to_timedelta(offsets, unit="s")
+        return timestamps.strftime(fmt).values
     except Exception:
         # Graceful fallback: emit ISO "epoch" strings
         return np.array(["2000-01-01T00:00:00"] * n, dtype=object)
@@ -1098,13 +1105,16 @@ def _generate_ids(cm: ColumnManifest, n: int, rng: np.random.Generator) -> np.nd
 
     if strategy == "hash":
         return np.array(
-            [hashlib.md5(str(rng.integers(0, int(1e15))).encode()).hexdigest()
+            [hashlib.md5(str(rng.integers(0, 2**128)).encode()).hexdigest()
              for _ in range(n)],
             dtype=object,
         )
 
-    # Default: uuid4
-    return np.array([str(uuid.uuid4()) for _ in range(n)], dtype=object)
+    # Default: uuid4 — deterministic from seeded rng
+    return np.array(
+        [str(uuid.UUID(int=int(rng.integers(0, 2**128)))) for _ in range(n)],
+        dtype=object,
+    )
 
 
 def _sample_freetext(cm: ColumnManifest, n: int, rng: np.random.Generator) -> np.ndarray:
@@ -1130,9 +1140,12 @@ def _sample_freetext(cm: ColumnManifest, n: int, rng: np.random.Generator) -> np
             # Sample n points from the Gaussian
             sampled = rng.normal(loc=mu, scale=np.sqrt(var), size=(n, len(mu)))
 
-            # Nearest-neighbor decode back to original text
-            nn = NearestNeighbors(n_neighbors=1, metric="euclidean")
-            nn.fit(latent)
+            # Nearest-neighbor decode back to original text (ISSUE 11 fix: use pre-fitted model)
+            if cm._nn_model is not None:
+                nn = cm._nn_model
+            else:
+                nn = NearestNeighbors(n_neighbors=1, metric="euclidean")
+                nn.fit(latent)
             _, indices = nn.kneighbors(sampled)
             indices = indices.flatten()
 
@@ -1155,8 +1168,16 @@ def _sample_high_card(cm: ColumnManifest, n: int, rng: np.random.Generator) -> n
     # Use the full value pool when available (NOT top_k truncated)
     if cm.value_pool and len(cm.value_pool) > 0:
         pool = cm.value_pool
-        indices = rng.integers(0, len(pool), size=n)
-        return np.array([pool[i] for i in indices], dtype=object)
+        # Use frequency weights when available to preserve the original
+        # distribution shape instead of flattening to uniform.
+        if cm._freq_table and len(cm._freq_table) > 0:
+            freq = cm._freq_table
+            weights = np.array([freq.get(str(v), 1e-9) for v in pool], dtype=float)
+            weights = weights / weights.sum()
+            idx = rng.choice(len(pool), size=n, p=weights)
+        else:
+            idx = rng.integers(0, len(pool), size=n)
+        return np.array([pool[i] for i in idx], dtype=object)
 
     # Fallback: frequency table sampling
     if cm._freq_table:
@@ -1323,9 +1344,25 @@ class CategoricalEncoder:
         Map continuous columns back to original category values.
         Output values always within the original category set.
 
-        rng : optional random generator; when provided, adds small Gaussian
-              noise (σ = 5% of the minimum category gap) before nearest-
-              neighbour snapping to reduce decode-time artefacts.
+        FIX-05: uses a temperature-calibrated softmax over distance to
+        each category's encoded center, sampled via `rng`, instead of
+        deterministic nearest-neighbor snapping. A value exactly halfway
+        between two category encodings under deterministic argmin always
+        resolves to the same category; real conditional distributions
+        show stochastic mixing near such boundaries. Temperature
+        auto-calibrates per column to 1/4 of that column's minimum
+        inter-category gap, so well-separated categories still decode
+        almost deterministically while tightly-packed ones mix more.
+
+        This replaces the previous small pre-snap Gaussian jitter (whose
+        only documented purpose was the same boundary-smoothing goal) —
+        the two are not layered, since stacking two independent
+        randomization mechanisms for one statistical problem would make
+        the effective smoothing un-auditable and harder to reason about.
+
+        rng : optional random generator. When None, decoding falls back
+              to deterministic nearest-neighbor (matches the previous
+              no-rng behavior exactly).
         """
         result: Dict[str, np.ndarray] = {}
 
@@ -1340,25 +1377,31 @@ class CategoricalEncoder:
             if enc_name not in df.columns:
                 continue
 
-            # Vectorised nearest-neighbour decode
-            cat_vals = np.array(list(enc.category_map.values()), dtype=float)
-            if len(cat_vals) >= 2 and rng is not None:
-                min_gap = float(np.min(np.diff(np.sort(cat_vals))))
-                raw = df[enc_name].values.astype(float)
-                raw = raw + rng.normal(0, min_gap * 0.05, size=len(raw))
-                values = raw.reshape(-1, 1)
-            else:
-                values = df[enc_name].values.astype(float).reshape(-1, 1)
-            cat_encoded = np.array(
-                list(enc.category_map.values()), dtype=float
-            ).reshape(1, -1)
-            distances = np.abs(values - cat_encoded)        # (n, k)
-            nearest_idx = np.argmin(distances, axis=1)      # (n,)
+            cat_keys = np.array(list(enc.category_map.keys()), dtype=object)
+            centers  = np.array(list(enc.category_map.values()), dtype=float)
+            values   = df[enc_name].values.astype(float).reshape(-1, 1)  # (n, 1)
+            distances = np.abs(values - centers.reshape(1, -1))          # (n, k)
 
-            cat_keys = np.array(
-                list(enc.category_map.keys()), dtype=object
-            )
-            result[col] = cat_keys[nearest_idx]
+            if rng is not None and len(centers) >= 2:
+                sorted_centers = np.sort(centers)
+                gaps = np.diff(sorted_centers)
+                temperature = float(gaps.min()) / 4.0 if len(gaps) > 0 else 0.1
+                temperature = max(temperature, 1e-8)
+
+                logits = -distances / temperature
+                logits -= logits.max(axis=1, keepdims=True)  # numerical stability
+                probs = np.exp(logits)
+                probs /= probs.sum(axis=1, keepdims=True)
+
+                # Vectorized categorical sampling via the Gumbel-max trick
+                # (equivalent to rng.choice(k, p=row_probs) per row, but
+                # without a Python-level loop over n rows).
+                gumbel = -np.log(-np.log(rng.uniform(1e-12, 1.0, size=probs.shape)))
+                chosen_idx = np.argmax(np.log(probs + 1e-300) + gumbel, axis=1)
+            else:
+                chosen_idx = np.argmin(distances, axis=1)
+
+            result[col] = cat_keys[chosen_idx]
 
         return pd.DataFrame(result)
 
@@ -1452,7 +1495,7 @@ class CategoricalEncoder:
                 return
 
         # Strategy 2: Cramer's V partner
-        cv_partner = self._find_cv_partner(col, cv)
+        cv_partner = self._find_cv_partner(col, cv, df)
         if cv_partner is not None and cv_partner in df.columns:
             enc = self._fit_cv_encoding(col, cv_partner, df, categories)
             if enc is not None:
@@ -1488,9 +1531,20 @@ class CategoricalEncoder:
 
     @staticmethod
     def _find_cv_partner(
-        col: str, cv: Dict[str, float],
+        col: str, cv: Dict[str, float], df: Optional[pd.DataFrame] = None,
     ) -> Optional[str]:
-        """Return the strongest Cramer's V categorical partner, or None."""
+        """
+        Return the strongest Cramer's V categorical partner, or None.
+
+        FIX-09: raw Cramer's V has positive finite-sample bias that grows
+        with cardinality (bias ~= sqrt((k1-1)(k2-1)/n)), which can inflate
+        V enough to select a spurious high-cardinality partner over a
+        genuinely stronger low-cardinality one. When `df` is available,
+        each candidate's V is bias-corrected (Bergsma, 2013) before
+        comparison. `df` is optional (defaults to None, using raw V) so
+        this stays backward compatible with any caller that doesn't have
+        the DataFrame on hand.
+        """
         best: Optional[str] = None
         best_v = 0.0
         for key, v in cv.items():
@@ -1499,8 +1553,21 @@ class CategoricalEncoder:
                 continue
             a, b = parts
             partner = b if a == col else (a if b == col else None)
-            if partner is not None and abs(v) >= _CV_THRESHOLD and abs(v) > best_v:
-                best, best_v = partner, abs(v)
+            if partner is None or abs(v) < _CV_THRESHOLD:
+                continue
+
+            v_compare = abs(v)
+            if df is not None and col in df.columns and partner in df.columns:
+                pair = df[[col, partner]].dropna()
+                n_obs = len(pair)
+                if n_obs > 1:
+                    k1 = pair[col].astype(str).nunique()
+                    k2 = pair[partner].astype(str).nunique()
+                    bias_term = (k1 - 1) * (k2 - 1) / (n_obs - 1)
+                    v_compare = max(0.0, v ** 2 - bias_term) ** 0.5
+
+            if v_compare > best_v:
+                best, best_v = partner, v_compare
         return best
 
     # ── Strategy 1: point-biserial conditional mean ───────────────
@@ -1527,14 +1594,35 @@ class CategoricalEncoder:
         global_mean = float(num_series.mean())
         if math.isnan(global_mean):
             return None
+        global_var = float(num_series.var(ddof=1))
+        if math.isnan(global_var):
+            global_var = 0.0
 
+        # FIX-16: James-Stein shrinkage of each category's conditional mean
+        # toward the grand mean. For rare categories the raw sample mean is
+        # noisy; JS (1961) proves shrinking toward the grand mean dominates
+        # the raw per-group mean in MSE whenever there are >= 3 groups.
+        # Below 3 categories the (k-2) term in the JS formula is <= 1 and
+        # the estimator loses its dominance guarantee, so we fall back to
+        # the raw mean in that case.
+        use_james_stein = len(categories) >= 3 and global_var > 0
         cat_map: Dict[str, float] = {}
         for cat in categories:
             vals = num_series[cat_series == cat].dropna()
-            if len(vals) > 0:
-                cat_map[cat] = float(vals.mean())
-            else:
+            n_cat = len(vals)
+            if n_cat == 0:
                 cat_map[cat] = global_mean
+                continue
+            cat_mean = float(vals.mean())
+            if use_james_stein:
+                sq_dev = n_cat * (cat_mean - global_mean) ** 2
+                shrink = max(
+                    0.0,
+                    1 - (len(categories) - 2) * global_var / max(1e-10, sq_dev),
+                )
+                cat_map[cat] = global_mean + shrink * (cat_mean - global_mean)
+            else:
+                cat_map[cat] = cat_mean
 
         # Guard: if the numeric partner is a true binary column (only 0 and 1
         # as values), its conditional means land exactly at 0.0 and 1.0, which
@@ -1622,9 +1710,9 @@ class CategoricalEncoder:
         categories: List[str],
     ) -> _ColEncoding:
         """
-        Encode using Laplace-smoothed cumulative probability midpoints.
+        Encode using KT-smoothed cumulative probability midpoints.
 
-        P(class_i) = (count_i + 1) / (n + k)
+        P(class_i) = (count_i + 0.5) / (n + k * 0.5)
         midpoint_i = CDF(i-1) + P(i) / 2
 
         Values are always strictly inside (0, 1), never at boundaries.
@@ -1640,11 +1728,15 @@ class CategoricalEncoder:
             if cat not in sorted_cats:
                 sorted_cats.append(cat)
 
-        # Laplace-smoothed probabilities
+        # FIX-06: Krichevsky-Trofimov estimator replaces Laplace smoothing.
+        # KT adds 0.5 pseudo-counts per category (k/2 total) instead of 1
+        # (k total), which is minimax-optimal and has strictly lower MSE
+        # than Laplace for moderate-to-large k. See Krichevsky & Trofimov
+        # (1981).
         probs: Dict[str, float] = {}
         for cat in sorted_cats:
             count = int(vc.get(cat, 0))
-            probs[cat] = (count + 1) / (n_total + k)
+            probs[cat] = (count + 0.5) / (n_total + k * 0.5)
 
         # Cumulative midpoints
         cumsum = 0.0
