@@ -227,11 +227,178 @@ def _adaptive_bin_count(
     return max(lo, min(hi, int(n_valid / max(1, cardinality * min_per_cell))))
 
 
+def _shrink_covariance(cov: np.ndarray, n_obs: int, k_dims: int) -> np.ndarray:
+    """
+    IMP-04 / FIX-12 shared helper — shrinkage of a sample covariance matrix
+    toward its own diagonal (Ledoit & Wolf, 2004-style shrinkage-to-target;
+    target = diag(cov), i.e. correlations shrink toward independence while
+    each variable's own variance is preserved exactly). Reduces estimation
+    noise in the off-diagonal (correlation) entries, which are the noisiest
+    part of a sample covariance matrix, without assuming any particular
+    correlation structure.
+
+        shrink_alpha = min(1, k_dims / max(1, n_obs - k_dims - 1))
+        shrunk       = (1 - shrink_alpha) * cov + shrink_alpha * diag(cov)
+
+    Because the target is diag(cov) rather than a scalar multiple of the
+    identity, every diagonal entry of `shrunk` equals the corresponding
+    diagonal entry of `cov` EXACTLY, for any shrink_alpha:
+        shrunk[i,i] = (1-a)*cov[i,i] + a*cov[i,i] = cov[i,i]
+    Only the off-diagonal (covariance/correlation) entries are shrunk, by a
+    factor of exactly (1 - shrink_alpha), toward 0.
+
+    This targets diag(cov) rather than a scaled identity (an earlier
+    version of this helper used trace(cov)/k * I, matching the original
+    FIX-12 formula) specifically because a scaled-identity target implicitly
+    assumes every variable has roughly the same variance. When variances
+    differ by orders of magnitude (e.g. an income column vs. an age column
+    in the same covariance matrix), shrinking a low-variance dimension
+    toward the AVERAGE variance inflates it by orders of magnitude even at
+    a tiny shrink_alpha -- this was caught by IMP-04's mandatory "highly
+    unequal variances" adversarial test and is a strictly worse estimator
+    than shrinking toward the diagonal, which cannot distort variance scale
+    at all, by construction, regardless of how heterogeneous the variables
+    are. This is the "safer variant" alluded to for the global-covariance
+    case; it is strictly no worse than the scaled-identity target for the
+    original FIX-12 per-stratum use either (identical when variances happen
+    to be equal, better whenever they are not), so both callers share it.
+
+    shrink_alpha's behavior across n_obs/k_dims ratios is unchanged from
+    the original formula:
+      - n_obs >> k_dims: alpha near 0 -- shrinkage negligible.
+      - n_obs ~ k_dims: alpha approaches 1 -- off-diagonal entries shrink
+        toward 0 (independence), which is always well-defined and PD-safe
+        (a diagonal matrix with the observed, positive variances on the
+        diagonal is trivially positive definite).
+      - n_obs <= k_dims: alpha saturates at 1 (denominator floored at 1 via
+        max()) -- full shrinkage to diag(cov), safe for Cholesky even when
+        the raw sample covariance is singular.
+
+    Used by:
+      - FIX-12: per-stratum covariance for StatisticalEngine
+        (BaselineReader.build_class_stats)
+      - IMP-04: global AND per-class copula covariance for
+        ProbabilisticEngine (_fit_copula_params -- shared by both the
+        global fit and the per-label copula fit, so this one change point
+        naturally covers both without duplicating the shrinkage logic)
+
+    Callers are expected to apply _nearest_pd afterward as a final
+    numerical safety net (shrinking toward a PD target keeps the result PD
+    in exact arithmetic, but _nearest_pd guards against floating-point
+    drift) -- this function performs only the statistical shrinkage step.
+    """
+    k_dims = max(1, k_dims)
+    diag_target = np.diag(np.diagonal(cov))
+    shrink_alpha = min(1.0, k_dims / max(1, n_obs - k_dims - 1))
+    return (1 - shrink_alpha) * cov + shrink_alpha * diag_target
+
+
+def _protect_sparse_categories(
+    smoothed:          Dict[str, float],
+    raw_obs_freq:      Dict[str, float],
+    protection_factor: float = 0.5,
+    max_reserved_mass: float = 0.15,
+) -> Dict[str, float]:
+    """
+    IMP-11 — Sparse-category protection.
+
+    Prevents empirical-Bayes shrinkage (_shrink_freq_table) from pushing a
+    GENUINELY OBSERVED category's probability so low it effectively never
+    appears in generated output, without a naive fixed floor that could
+    flatten a high-cardinality or heavily-imbalanced distribution.
+
+    Mechanism: for each category actually observed in this obs set
+    (raw_obs_freq[c] > 0 -- note this is the pre-shrinkage empirical
+    frequency, i.e. the exact `obs_freq` argument _shrink_freq_table
+    already receives), set:
+
+        floor(c) = protection_factor * raw_obs_freq[c]
+
+    and raise smoothed[c] up to floor(c) if shrinkage pushed it below that.
+    The mass needed to fund every raise is taken proportionally from every
+    OTHER category's current probability (never from a floored category,
+    never from raw_obs_freq itself), which preserves the relative shape of
+    the rest of the distribution instead of flattening it.
+
+    Two independent safety bounds, both provable from the construction and
+    independent of cardinality:
+
+    1. Per-category bound: floor(c) <= protection_factor * raw_obs_freq[c].
+       Since a category's floor is always a strict *fraction* of its own
+       true observed rate (never an externally-chosen constant), the
+       mechanism can never make an observed category more prominent than
+       roughly half (protection_factor=0.5) of what it actually was in the
+       data -- it restores truth, it does not invent significance.
+
+    2. Aggregate bound: because Sum(raw_obs_freq[c]) == 1 over the observed
+       domain, Sum(floor(c)) <= protection_factor <= 1 in the worst case --
+       but the *additional* mass actually reserved (raise_amt, i.e. only
+       the deficit versus the already-shrunk value) is hard-capped at
+       `max_reserved_mass` (default 0.15) regardless of how many categories
+       need raising. A column with hundreds of rare categories therefore
+       cannot have more than 15% of its total probability mass reallocated
+       to protection, no matter how high the cardinality -- this is what
+       keeps the mechanism safe for high-cardinality columns and rules out
+       "near-uniform" collapse of a concentrated distribution.
+
+    Categories with raw_obs_freq[c] == 0 (not in raw_obs_freq at all, i.e.
+    never actually observed -- only present in `smoothed` via the
+    reference/global table) are NEVER floored: this is what distinguishes
+    IMP-11 from `p = max(p, floor)` and keeps unseen categories from being
+    artificially inflated.
+
+    Fast path: if no category needs raising (the common case for balanced
+    or already-well-shrunk distributions), returns `smoothed` unchanged --
+    zero extra allocation, zero extra normalization pass.
+    """
+    raise_amt: Dict[str, float] = {}
+    for cat, raw_p in raw_obs_freq.items():
+        if raw_p <= 0:
+            continue
+        floor = protection_factor * raw_p
+        cur = smoothed.get(cat, 0.0)
+        if floor > cur:
+            raise_amt[cat] = floor - cur
+
+    if not raise_amt:
+        return smoothed
+
+    total_raise = sum(raise_amt.values())
+    if total_raise > max_reserved_mass:
+        scale = max_reserved_mass / total_raise
+        raise_amt = {c: v * scale for c, v in raise_amt.items()}
+        total_raise = max_reserved_mass
+
+    donor_total = sum(p for c, p in smoothed.items() if c not in raise_amt)
+    if donor_total <= 0:
+        # Degenerate: every category in the table is already being raised
+        # (only possible with a handful of all-rare categories). There is
+        # no safe donor mass to draw from, so skip protection rather than
+        # risk a negative or invalid distribution.
+        return smoothed
+
+    scale_down = max(0.0, (donor_total - total_raise) / donor_total)
+    protected: Dict[str, float] = {}
+    for cat, p in smoothed.items():
+        if cat in raise_amt:
+            protected[cat] = p + raise_amt[cat]
+        else:
+            protected[cat] = p * scale_down
+
+    total = sum(protected.values())
+    if total > 0:
+        protected = {c: v / total for c, v in protected.items()}
+    return protected
+
+
 def _shrink_freq_table(
     obs_freq: Dict[str, float],
     ref_freq: Dict[str, float],
     n_obs: int,
     k_scale: float = 2.0,
+    protect_sparse: bool = True,
+    protection_factor: float = 0.5,
+    max_reserved_mass: float = 0.15,
 ) -> Dict[str, float]:
     """
     Empirical-Bayes shrinkage of an observed frequency table toward a
@@ -248,6 +415,14 @@ def _shrink_freq_table(
     (k_shrink = max(1, n_cats / 5) * k_scale); callers use different
     k_scale values to match their originally-approved formulas
     (10 for per-bin conditional tables, 2 for per-stratum tables).
+
+    IMP-11: after shrinking, `_protect_sparse_categories` runs on the
+    result (enabled by default via `protect_sparse`) so that categories
+    genuinely present in `obs_freq` don't get shrunk into effective
+    invisibility -- see that function's docstring for the mechanism and
+    its safety bounds. `obs_freq` is exactly the "genuinely observed"
+    signal it needs; no extra argument is required at any call site.
+    Pass protect_sparse=False to recover the pre-IMP-11 behavior exactly.
     """
     all_cats = set(obs_freq) | set(ref_freq)
     if not all_cats:
@@ -261,6 +436,10 @@ def _shrink_freq_table(
     total = sum(smoothed.values())
     if total > 0:
         smoothed = {c: v / total for c, v in smoothed.items()}
+    if protect_sparse and obs_freq:
+        smoothed = _protect_sparse_categories(
+            smoothed, obs_freq, protection_factor, max_reserved_mass
+        )
     return smoothed
 
 
@@ -462,6 +641,16 @@ class BaselineReader:
         # with keys min/max/q01/q05/q25/q50/q75/q95/q99 — same shape as
         # _build_quantile_cdf() expects.
         self.target_cat_quantiles: Dict[Tuple[str, str], Dict[str, float]] = {}
+
+        # Candidate #1: Cramér's V categorical↔categorical conditioning.
+        # Built by build_class_stats() when df is available.
+        # Structure: {target_col: {"partner": str, "tables": {partner_val: {cat: prob}}, "marginal": {cat: prob}}}
+        self.cv_cat_tables: Dict[str, Dict[str, Any]] = {}
+
+        # Candidate 3b: per-category numeric profiles for cat↔num conditioning.
+        # Built by build_class_stats() for each numeric col with a strong pb partner.
+        # Structure: {num_col: {"partner": cat_col, "profiles": {cat_val: quantile_spec}, "global": spec}}
+        self.catnum_profiles: Dict[str, Dict[str, Any]] = {}
 
     # ------------------------------------------------------------------
     # Convenience helpers
@@ -667,6 +856,131 @@ class BaselineReader:
             self.null_corr = None
             self.null_cols = []
 
+        # ── Candidate #1: build Cramér's V conditional tables ────────────
+        # For each categorical column, find the strongest qualifying
+        # categorical partner (V >= 0.30, K_target × K_partner <= N/5),
+        # and build P(target | partner=p) conditional frequency tables.
+        # These are used by StatisticalEngine's unlabelled path.
+        cat_cols_in_df = [c for c in self.categorical if c in df.columns]
+        n_total = len(df)
+        self.cv_cat_tables = {}
+        if n_total > 0 and cat_cols_in_df:
+            cat_set = set(cat_cols_in_df)
+            for col in cat_cols_in_df:
+                best_partner: Optional[str] = None
+                best_v: float = 0.0
+                for key, v in self.cramers_v.items():
+                    parts = key.split("__")
+                    if len(parts) != 2:
+                        continue
+                    if col not in parts:
+                        continue
+                    partner = parts[1] if parts[0] == col else parts[0]
+                    if partner not in cat_set:
+                        continue
+                    if v < 0.30:
+                        continue
+                    # Sparsity guard: K_target × K_partner <= N / 5
+                    k_col = int(df[col].dropna().astype(str).nunique())
+                    k_ptr = int(df[partner].dropna().astype(str).nunique())
+                    if k_col * k_ptr > n_total / 5:
+                        continue
+                    if v > best_v:
+                        best_v = v
+                        best_partner = partner
+                if best_partner is None:
+                    continue
+                # Build P(col | partner=p) for each partner value
+                global_freq = (
+                    df[col].dropna().astype(str)
+                    .value_counts(normalize=True).to_dict()
+                )
+                mask_both = df[col].notna() & df[best_partner].notna()
+                t_series = df[col][mask_both].astype(str)
+                p_series = df[best_partner][mask_both].astype(str)
+                cond_tables: Dict[str, Dict[str, float]] = {}
+                for pv in p_series.unique():
+                    sub = t_series[p_series == pv]
+                    n_sub = len(sub)
+                    if n_sub < 5:
+                        # Sparse partner value → will fall back to marginal
+                        continue
+                    obs = sub.value_counts(normalize=True).to_dict()
+                    cond_tables[str(pv)] = _shrink_freq_table(
+                        obs, global_freq, n_sub,
+                        k_scale=2.0, protect_sparse=True,
+                    )
+                if cond_tables:
+                    self.cv_cat_tables[col] = {
+                        "partner": best_partner,
+                        "tables": cond_tables,
+                        "marginal": global_freq,
+                    }
+
+        # Candidate 3b: per-category numeric profiles for cat→num conditioning.
+        # For each numeric column with a strong point-biserial partner,
+        # build 17-knot quantile profiles per category value so
+        # _sample_numeric_col can produce P(num | cat_partner=v).
+        _PB_THRESHOLD = 0.30
+        _MIN_PER_CAT  = 10
+        self.catnum_profiles = {}
+        pb_pairs = self.strong_pb_pairs(threshold=_PB_THRESHOLD)
+        # Group by numeric col → pick strongest pb partner
+        _best_pb: Dict[str, Tuple[str, float]] = {}  # num_col → (cat_col, r)
+        for cat_col, num_col, r in pb_pairs:
+            if num_col not in self.numeric or cat_col not in self.categorical:
+                continue
+            if num_col not in df.columns or cat_col not in df.columns:
+                continue
+            if num_col not in _best_pb or r > _best_pb[num_col][1]:
+                _best_pb[num_col] = (cat_col, r)
+        for num_col, (cat_col, _r) in _best_pb.items():
+            num_series = _pd.to_numeric(df[num_col], errors="coerce")
+            cat_series = df[cat_col].astype(str)
+            global_spec = self.numeric.get(num_col, {})
+            profiles: Dict[str, Dict[str, Any]] = {}
+            for cv in cat_series.dropna().unique():
+                sub = num_series[cat_series == cv].dropna()
+                if len(sub) < _MIN_PER_CAT:
+                    continue  # sparse → falls back to global
+                std_val = float(sub.std())
+                entry: Dict[str, Any] = {
+                    "mean": float(sub.mean()),
+                    "std":  std_val if std_val > 0 else 1e-6,
+                    "min":  float(sub.min()),
+                    "max":  float(sub.max()),
+                    "q01":  float(sub.quantile(0.01)),
+                    "q02":  float(sub.quantile(0.02)),
+                    "q05":  float(sub.quantile(0.05)),
+                    "q10":  float(sub.quantile(0.10)),
+                    "q20":  float(sub.quantile(0.20)),
+                    "q25":  float(sub.quantile(0.25)),
+                    "q35":  float(sub.quantile(0.35)),
+                    "q50":  float(sub.quantile(0.50)),
+                    "q65":  float(sub.quantile(0.65)),
+                    "q75":  float(sub.quantile(0.75)),
+                    "q80":  float(sub.quantile(0.80)),
+                    "q90":  float(sub.quantile(0.90)),
+                    "q95":  float(sub.quantile(0.95)),
+                    "q98":  float(sub.quantile(0.98)),
+                    "q99":  float(sub.quantile(0.99)),
+                }
+                # Mirror value_ratios for discrete cols
+                if global_spec.get("value_ratios") is not None:
+                    s_int = sub.round(0)
+                    vc = s_int.value_counts(dropna=True)
+                    denom = int(s_int.shape[0]) or 1
+                    entry["value_ratios"] = {
+                        str(int(k)): (int(v) / denom) for k, v in vc.items()
+                    }
+                profiles[str(cv)] = entry
+            if profiles:
+                self.catnum_profiles[num_col] = {
+                    "partner": cat_col,
+                    "profiles": profiles,
+                    "global": global_spec,
+                }
+
         if not self.label_col or self.label_col not in df.columns:
             return
 
@@ -747,14 +1061,39 @@ class BaselineReader:
                     "std":  std_val if std_val > 0 else 1e-6,
                     "min":  float(s.min()),
                     "max":  float(s.max()),
+                    # IMP-01: 17-knot quantile profile (see _build_quantile_cdf)
                     "q01":  float(s.quantile(0.01)),
+                    "q02":  float(s.quantile(0.02)),
                     "q05":  float(s.quantile(0.05)),
+                    "q10":  float(s.quantile(0.10)),
+                    "q20":  float(s.quantile(0.20)),
                     "q25":  float(s.quantile(0.25)),
+                    "q35":  float(s.quantile(0.35)),
                     "q50":  float(s.quantile(0.50)),
+                    "q65":  float(s.quantile(0.65)),
                     "q75":  float(s.quantile(0.75)),
+                    "q80":  float(s.quantile(0.80)),
+                    "q90":  float(s.quantile(0.90)),
                     "q95":  float(s.quantile(0.95)),
+                    "q98":  float(s.quantile(0.98)),
                     "q99":  float(s.quantile(0.99)),
                 }
+
+                # IMP-10: mirror the global value_ratios qualification for this
+                # stratum so label-conditioned sampling can also use discrete
+                # empirical sampling instead of quantile-CDF + rounding.
+                # Qualification is read from the already-computed global spec
+                # (bl.numeric[col]) rather than re-derived, so the per-class
+                # table is only built for columns the global baseline already
+                # classified as discrete/count-like.
+                global_spec = self.numeric.get(col, {})
+                if global_spec.get("value_ratios") is not None:
+                    s_int = s.round(0)
+                    vc = s_int.value_counts(dropna=True)
+                    denom = int(s_int.shape[0]) or 1
+                    entry[self._norm_lv(lv)]["value_ratios"] = {
+                        str(int(k)): (int(v) / denom) for k, v in vc.items()
+                    }
 
             # Categorical per-class stats — empirical-Bayes shrinkage toward
             # the column's global frequency table, weighted by how many rows
@@ -843,12 +1182,21 @@ class BaselineReader:
                         self.target_cat_quantiles[(self._norm_lv(lv), cat)] = {
                             "min":  float(vals.min()),
                             "max":  float(vals.max()),
+                            # IMP-01: 17-knot quantile profile (see _build_quantile_cdf)
                             "q01":  float(vals.quantile(0.01)),
+                            "q02":  float(vals.quantile(0.02)),
                             "q05":  float(vals.quantile(0.05)),
+                            "q10":  float(vals.quantile(0.10)),
+                            "q20":  float(vals.quantile(0.20)),
                             "q25":  float(vals.quantile(0.25)),
+                            "q35":  float(vals.quantile(0.35)),
                             "q50":  float(vals.quantile(0.50)),
+                            "q65":  float(vals.quantile(0.65)),
                             "q75":  float(vals.quantile(0.75)),
+                            "q80":  float(vals.quantile(0.80)),
+                            "q90":  float(vals.quantile(0.90)),
                             "q95":  float(vals.quantile(0.95)),
+                            "q98":  float(vals.quantile(0.98)),
                             "q99":  float(vals.quantile(0.99)),
                         }
 
@@ -868,11 +1216,13 @@ class BaselineReader:
                 # only forces positive-definiteness, it doesn't reduce that
                 # noise. Ledoit & Wolf (2004) shrinkage dominates the
                 # sample covariance in MSE whenever p/n > 0.1.
+                #
+                # Uses the shared _shrink_covariance helper (see module-
+                # level docstring) so this formula and IMP-04's global/
+                # per-class copula shrinkage share one implementation.
                 n_sub_cov   = len(sub)
                 k_cols      = len(num_cols)
-                trace_cov   = np.trace(cov) / k_cols
-                shrink_alpha = min(1.0, k_cols / max(1, n_sub_cov - k_cols - 1))
-                cov = (1 - shrink_alpha) * cov + shrink_alpha * trace_cov * np.eye(k_cols)
+                cov = _shrink_covariance(cov, n_sub_cov, k_cols)
                 cov = _nearest_pd(cov)
                 self.class_covariance[self._norm_lv(lv)] = (mu, cov, num_cols)
 
@@ -1008,10 +1358,19 @@ class StatisticalEngine:
 
                 data[bl.label_col] = target_arr
 
-            # 2b. Sample numeric features conditioned on label
+            # 2b. Sample numeric features conditioned on label.
+            #     Candidate 3b: defer numerics whose strongest pb partner is
+            #     a non-label categorical to step 5 (after categoricals are
+            #     sampled), so per-category quantile profiles can be used.
+            catnum = getattr(bl, 'catnum_profiles', {})
+            _deferred_num: List[str] = []  # cols deferred to step 5
             for col, spec in bl.numeric.items():
                 if col == bl.label_col and bl.target_type == "regression":
                     continue  # already sampled above — do not overwrite
+                # Check if this numeric's pb partner is non-label
+                if col in catnum and catnum[col]["partner"] != bl.label_col:
+                    _deferred_num.append(col)
+                    continue  # deferred to step 5
                 arr = np.empty(n, dtype=float)
                 for lv in label_choices:
                     mask   = labels == lv
@@ -1029,13 +1388,84 @@ class StatisticalEngine:
             # 3. Cholesky covariance injection per label class
             data = self._inject_numeric_correlations_labeled(data, labels, label_choices)
 
-            # 4. Sample categorical features (non-label) conditioned on label
+            # 4. Sample categorical features (non-label).
+            #    Candidate #2: evidence-based conditioning source selection.
+            #    For each non-label categorical, if a categorical partner is
+            #    substantially stronger than the label
+            #    (V(col,partner) > V(col,label) + 0.15), use the partner's
+            #    already-generated values for conditioning instead of the
+            #    label.  Otherwise, use label conditioning as before.
+            cv_tables = getattr(bl, 'cv_cat_tables', {})
+
+            # Determine which columns override label → partner conditioning
+            _OVERRIDE_MARGIN = 0.15
+            partner_override: Dict[str, Dict] = {}
+            for col in bl.categorical:
+                if col == bl.label_col:
+                    continue
+                if col == bl.primary_target_cat_col and primary_col_values is not None:
+                    continue
+                if col not in cv_tables:
+                    continue
+                info = cv_tables[col]
+                partner = info["partner"]
+                # Skip if partner is the label itself (would be circular)
+                if partner == bl.label_col:
+                    continue
+                # V(col, partner) — already >= 0.30 by cv_cat_tables gate
+                v_cp = (bl.cramers_v.get(f"{col}__{partner}") or
+                        bl.cramers_v.get(f"{partner}__{col}") or 0.0)
+                # V(col, label)
+                v_cl = (bl.cramers_v.get(f"{col}__{bl.label_col}") or
+                        bl.cramers_v.get(f"{bl.label_col}__{col}") or 0.0)
+                if v_cp > v_cl + _OVERRIDE_MARGIN:
+                    partner_override[col] = info
+
+            # Topological sort for partner-overridden columns so each
+            # column's partner is already in `data` when it's sampled.
+            override_set = set(partner_override.keys())
+            sorted_override: List[str] = []
+            if override_set:
+                dep_ov = {c: partner_override[c]["partner"] for c in override_set}
+                dep_v_ov = {}
+                for c in override_set:
+                    p = dep_ov[c]
+                    dep_v_ov[c] = (bl.cramers_v.get(f"{c}__{p}") or
+                                   bl.cramers_v.get(f"{p}__{c}") or 0.0)
+                # Break cycles (same pattern as Candidate 3a)
+                to_demote_ov: set = set()
+                visited_ov: set = set()
+                for start in sorted(override_set):
+                    if start in visited_ov or start in to_demote_ov:
+                        continue
+                    path = []; cur = start; path_set: set = set()
+                    while cur in override_set and cur not in path_set and cur not in to_demote_ov:
+                        path.append(cur); path_set.add(cur); cur = dep_ov[cur]
+                    if cur in path_set:
+                        ci = path.index(cur); cycle = path[ci:]
+                        weakest = min(cycle, key=lambda c: dep_v_ov.get(c, 0.0))
+                        to_demote_ov.add(weakest)
+                    visited_ov.update(path)
+                override_set -= to_demote_ov
+                # Kahn's algorithm
+                rem_ov = set(override_set)
+                max_it = len(rem_ov) + 1
+                while rem_ov and max_it > 0:
+                    max_it -= 1
+                    ready = sorted(c for c in rem_ov if dep_ov[c] not in rem_ov)
+                    if not ready:
+                        arb = min(rem_ov, key=lambda c: dep_v_ov.get(c, 0.0))
+                        rem_ov.discard(arb); to_demote_ov.add(arb); continue
+                    sorted_override.extend(ready); rem_ov -= set(ready)
+
+            # 4a. Sample label-conditioned columns (non-overridden)
             for col, spec in bl.categorical.items():
                 if col == bl.label_col:
                     continue
-                # Fix 3: primary categorical already sampled above — skip re-draw.
                 if col == bl.primary_target_cat_col and primary_col_values is not None:
                     continue
+                if col in override_set:
+                    continue  # deferred to partner-conditioned pass
                 arr = np.empty(n, dtype=object)
                 for lv in label_choices:
                     mask = labels == lv
@@ -1055,15 +1485,250 @@ class StatisticalEngine:
                         arr[mask] = self._sample_categorical_col(col, spec, n_lv)
                 data[col] = arr
 
+            # 4b. Sample partner-conditioned columns (topological order)
+            for col in sorted_override:
+                spec = bl.categorical.get(col, {})
+                info = partner_override[col]
+                partner_col = info["partner"]
+                tables      = info["tables"]
+                marginal    = info["marginal"]
+                partner_vals = data.get(partner_col)
+                if partner_vals is None:
+                    # Defensive: fall back to label conditioning
+                    arr = np.empty(n, dtype=object)
+                    for lv in label_choices:
+                        mask = labels == lv
+                        n_lv = int(mask.sum())
+                        if n_lv == 0:
+                            continue
+                        cls_freq = bl.class_cat_stats.get(col, {}).get(bl._norm_lv(lv))
+                        if cls_freq:
+                            choices = list(cls_freq.keys())
+                            wts     = np.array(list(cls_freq.values()), dtype=float)
+                            wts     = wts / wts.sum()
+                            arr[mask] = np.array(choices, dtype=object)[
+                                rng.choice(len(choices), size=n_lv, p=wts)
+                            ]
+                        else:
+                            arr[mask] = self._sample_categorical_col(col, spec, n_lv)
+                    data[col] = arr
+                    continue
+                arr = np.empty(n, dtype=object)
+                marg_cats = list(marginal.keys()) if marginal else []
+                marg_p    = (np.array(list(marginal.values()), dtype=float)
+                             if marginal else np.array([]))
+                if len(marg_p) > 0 and marg_p.sum() > 0:
+                    marg_p = marg_p / marg_p.sum()
+                for pv in np.unique(partner_vals):
+                    mask = partner_vals == pv
+                    n_pv = int(mask.sum())
+                    if n_pv == 0:
+                        continue
+                    ct = tables.get(str(pv))
+                    if ct:
+                        cats = list(ct.keys())
+                        wts  = np.array(list(ct.values()), dtype=float)
+                        wts  = wts / wts.sum()
+                        arr[mask] = np.array(cats, dtype=object)[
+                            rng.choice(len(cats), size=n_pv, p=wts)
+                        ]
+                    elif marg_cats and len(marg_p) > 0:
+                        arr[mask] = np.array(marg_cats, dtype=object)[
+                            rng.choice(len(marg_cats), size=n_pv, p=marg_p)
+                        ]
+                    else:
+                        arr[mask] = self._sample_categorical_col(
+                            col, spec, n_pv
+                        )
+                data[col] = arr
+
+            # 5. Candidate 3b: sample deferred numerics using per-category
+            #    profiles.  These were skipped in step 2b because their
+            #    strongest pb partner is a non-label categorical that was
+            #    only available after step 4.
+            for col in _deferred_num:
+                spec = bl.numeric.get(col, {})
+                info = catnum[col]
+                partner_col = info["partner"]
+                profiles    = info["profiles"]
+                global_spec = info["global"]
+                partner_vals = data.get(partner_col)
+                if partner_vals is not None:
+                    arr = np.empty(n, dtype=float)
+                    for cv in np.unique(partner_vals):
+                        mask = partner_vals == cv
+                        n_cv = int(mask.sum())
+                        if n_cv == 0:
+                            continue
+                        prof = profiles.get(str(cv))
+                        cond_spec = prof if prof else global_spec
+                        arr[mask] = self._sample_numeric_col(
+                            col, cond_spec, n_cv
+                        )
+                    data[col] = arr
+                else:
+                    # Partner not sampled — use label conditioning
+                    arr = np.empty(n, dtype=float)
+                    for lv in label_choices:
+                        mask = labels == lv
+                        n_lv = int(mask.sum())
+                        if n_lv == 0:
+                            continue
+                        cls_stats = bl.class_numeric_stats.get(col, {}).get(bl._norm_lv(lv))
+                        cond_spec = cls_stats if cls_stats else spec
+                        arr[mask] = self._sample_numeric_col(col, cond_spec, n_lv)
+                    data[col] = arr
+
         else:
-            # ---- Unlabelled path (original behaviour) ----
+            # ---- Unlabelled path ----
+            # Order: categoricals → numerics (cat-conditioned) → Cholesky.
+            # Categoricals must be sampled first so their values are available
+            # for cat→num conditioning (Candidate 3b).
+
+            # Candidate #1 + 3a: topologically-ordered categorical sampling.
+            # Each conditioned column must be sampled AFTER its partner.
+            # When cycles exist (A→B and B→A), break the weakest link
+            # so at least one column in the cycle is sampled from marginal,
+            # seeding the rest of the chain.
+            cv_tables = getattr(bl, 'cv_cat_tables', {})
+
+            # Build dependency: col → partner (only for cols in bl.categorical)
+            dep: Dict[str, str] = {}  # col → its partner
+            dep_v: Dict[str, float] = {}  # col → V with its partner
+            for col, info in cv_tables.items():
+                if col in bl.categorical:
+                    dep[col] = info["partner"]
+                    # Retrieve V from cramers_v dict (try both key orders)
+                    p = info["partner"]
+                    v_val = (bl.cramers_v.get(f"{col}__{p}") or
+                             bl.cramers_v.get(f"{p}__{col}") or 0.0)
+                    dep_v[col] = v_val
+
+            # Break cycles: find all cols in mutual cycles and demote
+            # the weakest-V column in each cycle to marginal sampling.
+            conditioned = set(dep.keys())
+            # Detect cycles via DFS-style walk
+            to_demote: set = set()
+            visited: set = set()
+            for start in list(conditioned):
+                if start in visited or start in to_demote:
+                    continue
+                path = []
+                cur = start
+                path_set: set = set()
+                while cur in conditioned and cur not in path_set and cur not in to_demote:
+                    path.append(cur)
+                    path_set.add(cur)
+                    cur = dep[cur]
+                if cur in path_set:
+                    # Found a cycle — collect cycle members
+                    cycle_start = path.index(cur)
+                    cycle = path[cycle_start:]
+                    # Demote the member with the weakest V
+                    weakest = min(cycle, key=lambda c: dep_v.get(c, 0.0))
+                    to_demote.add(weakest)
+                visited.update(path)
+
+            conditioned -= to_demote
+
+            # Topological sort of conditioned columns (no cycles remain)
+            sorted_cond: List[str] = []
+            remaining = set(conditioned)
+            # A column is "ready" if its partner is NOT in remaining
+            # (i.e. partner will be sampled from marginal or already sorted)
+            max_iters = len(remaining) + 1
+            while remaining and max_iters > 0:
+                max_iters -= 1
+                ready = [c for c in remaining
+                         if dep[c] not in remaining]
+                if not ready:
+                    # Safety: shouldn't happen after cycle-breaking,
+                    # but if it does, demote an arbitrary column
+                    arb = min(remaining, key=lambda c: dep_v.get(c, 0.0))
+                    remaining.discard(arb)
+                    to_demote.add(arb)
+                    continue
+                # Deterministic order: sort by column name for reproducibility
+                ready.sort()
+                sorted_cond.extend(ready)
+                remaining -= set(ready)
+
+            # Sample marginal columns first (unconditioned + demoted)
+            for col, spec in bl.categorical.items():
+                if col not in conditioned:
+                    data[col] = self._sample_categorical_col(col, spec, n)
+
+            # Sample conditioned columns in topological order
+            for col in sorted_cond:
+                spec = bl.categorical.get(col, {})
+                info = cv_tables[col]
+                partner_col = info["partner"]
+                tables      = info["tables"]
+                marginal    = info["marginal"]
+                partner_vals = data.get(partner_col)
+                if partner_vals is None:
+                    # Defensive fallback (should not happen after topo-sort)
+                    data[col] = self._sample_categorical_col(col, spec, n)
+                    continue
+                arr = np.empty(n, dtype=object)
+                marg_cats = list(marginal.keys()) if marginal else []
+                marg_p    = (np.array(list(marginal.values()), dtype=float)
+                             if marginal else np.array([]))
+                if marg_p.sum() > 0:
+                    marg_p = marg_p / marg_p.sum()
+                for pv in np.unique(partner_vals):
+                    mask = partner_vals == pv
+                    n_pv = int(mask.sum())
+                    if n_pv == 0:
+                        continue
+                    ct = tables.get(str(pv))
+                    if ct:
+                        cats = list(ct.keys())
+                        wts  = np.array(list(ct.values()), dtype=float)
+                        wts  = wts / wts.sum()
+                        arr[mask] = np.array(cats, dtype=object)[
+                            rng.choice(len(cats), size=n_pv, p=wts)
+                        ]
+                    elif marg_cats and len(marg_p) > 0:
+                        arr[mask] = np.array(marg_cats, dtype=object)[
+                            rng.choice(len(marg_cats), size=n_pv, p=marg_p)
+                        ]
+                    else:
+                        arr[mask] = self._sample_categorical_col(
+                            col, spec, n_pv
+                        )
+                data[col] = arr
+
+            # Candidate 3b: sample numerics conditioned on cat pb partners.
+            # Categoricals are now in `data`, so per-category quantile
+            # profiles can be used for numeric columns with strong pb.
+            catnum = getattr(bl, 'catnum_profiles', {})
             for col, spec in bl.numeric.items():
-                data[col] = self._sample_numeric_col(col, spec, n)
+                if col in catnum:
+                    info = catnum[col]
+                    partner_col = info["partner"]
+                    profiles    = info["profiles"]
+                    global_spec = info["global"]
+                    partner_vals = data.get(partner_col)
+                    if partner_vals is not None:
+                        arr = np.empty(n, dtype=float)
+                        for cv in np.unique(partner_vals):
+                            mask = partner_vals == cv
+                            n_cv = int(mask.sum())
+                            if n_cv == 0:
+                                continue
+                            prof = profiles.get(str(cv))
+                            cond_spec = prof if prof else global_spec
+                            arr[mask] = self._sample_numeric_col(
+                                col, cond_spec, n_cv
+                            )
+                        data[col] = arr
+                    else:
+                        data[col] = self._sample_numeric_col(col, spec, n)
+                else:
+                    data[col] = self._sample_numeric_col(col, spec, n)
 
             data = self._inject_numeric_correlations(data, n)
-
-            for col, spec in bl.categorical.items():
-                data[col] = self._sample_categorical_col(col, spec, n)
 
         # Other columns (datetime/object — emit None, constraint pass handles)
         for col in bl.other:
@@ -1093,7 +1758,19 @@ class StatisticalEngine:
         • Works for symmetric, skewed, and heavy-tailed distributions
 
         Falls back to uniform sampling only when min == max (degenerate column).
+
+        IMP-10: when spec carries a "value_ratios" table (populated at baseline
+        time for discrete/count-like low-cardinality integer columns — see
+        baseline.py), sample directly from that empirical distribution instead
+        of the quantile-CDF pipeline. This preserves exact observed support and
+        empirical frequency differences between values without the "treat as
+        continuous, then round" distortion. Absent for every other column, so
+        this is a no-op fallback to the existing behavior.
         """
+        ratios = spec.get("value_ratios") if isinstance(spec, dict) else None
+        if ratios:
+            return _sample_integer_empirical(ratios, n, self.rng)
+
         levels, values = _build_quantile_cdf(spec)
 
         if levels is None:
@@ -1157,7 +1834,12 @@ class StatisticalEngine:
         rng = self.rng
         n   = len(labels)
 
-        num_cols_present = [c for c in bl.numeric if c in data]
+        # IMP-10: exclude discrete-empirical columns from Cholesky injection —
+        # see the matching guard in _apply_cholesky_correlations for why.
+        num_cols_present = [
+            c for c in bl.numeric
+            if c in data and not (bl.numeric.get(c) or {}).get("value_ratios")
+        ]
         if bl.target_type == "regression" and bl.label_col in num_cols_present:
             # The target was already drawn from its stratum range in step 2a;
             # injecting Cholesky-based correlation here would overwrite that
@@ -1176,7 +1858,10 @@ class StatisticalEngine:
             # Use per-class covariance if available, else global Pearson-based
             if bl._norm_lv(lv) in bl.class_covariance:
                 mu, cov, col_names = bl.class_covariance[bl._norm_lv(lv)]
-                cols_here = [c for c in col_names if c in data]
+                cols_here = [
+                    c for c in col_names
+                    if c in data and not (bl.numeric.get(c) or {}).get("value_ratios")
+                ]
                 if len(cols_here) < 2:
                     continue
                 idx_in_cov = [col_names.index(c) for c in cols_here]
@@ -1452,6 +2137,17 @@ class ProbabilisticEngine:
 
         mu  = Z.mean(axis=0)
         cov = np.cov(Z, rowvar=False) if Z.shape[1] > 1 else np.array([[1.0]])
+        # IMP-04: shrink the sample covariance toward a scaled identity
+        # before the nearest-PD projection, using the same estimator as
+        # FIX-12's per-stratum shrinkage (_shrink_covariance; see its
+        # module-level docstring). This function is shared by both the
+        # global copula fit (large n, moderate dimensionality -- shrinkage
+        # is near-zero here, as intended) and the per-label copula fit
+        # (small per-class n -- shrinkage engages the same way FIX-12's
+        # per-stratum numeric covariance already does), so one change here
+        # covers both without a second regularization system.
+        if Z.shape[1] > 1:
+            cov = _shrink_covariance(cov, Z.shape[0], Z.shape[1])
         cov = _nearest_pd(cov)
         return mu, cov, cdfs
 
@@ -2987,16 +3683,38 @@ def _build_quantile_cdf(
     """
     Build a piecewise-linear inverse CDF from a numeric column spec.
 
-    Uses all quantile statistics present in the spec:
+    IMP-01: uses all quantile statistics present in the spec, at up to 17
+    knots (min, max, plus 15 interior percentiles):
         (0.00 → min)
         (0.01 → q01)   if available
+        (0.02 → q02)   if available
         (0.05 → q05)   if available
+        (0.10 → q10)   if available
+        (0.20 → q20)   if available
         (0.25 → q25)   if available
+        (0.35 → q35)   if available
         (0.50 → q50)   if available, else mean used as anchor
+        (0.65 → q65)   if available
         (0.75 → q75)   if available
+        (0.80 → q80)   if available
+        (0.90 → q90)   if available
         (0.95 → q95)   if available
+        (0.98 → q98)   if available
         (0.99 → q99)   if available
         (1.00 → max)
+
+    This was densified from the original 9-knot set (min, q01, q05, q25,
+    q50, q75, q95, q99, max) after benchmarking showed 17 knots meaningfully
+    reduces empirical-distribution reconstruction error (Wasserstein
+    distance) versus 9 across normal/skewed/heavy-tailed/bimodal/
+    exponential distributions, while 25 knots was not reliably better (and
+    was sometimes worse on heavy-tailed data — see IMP-01 final report).
+
+    Every added key is read via spec.get(key) exactly like the original 7,
+    so specs from OLDER cached baselines that lack the new keys (q02, q10,
+    q20, q35, q65, q80, q90, q98) simply produce fewer anchors -- the
+    9-knot behavior -- with no special-case code required; this function
+    already tolerates any subset of the recognized keys being present.
 
     The resulting (levels, values) arrays can be passed directly to
     np.interp(u, levels, values) for inverse-CDF sampling.
@@ -3025,9 +3743,11 @@ def _build_quantile_cdf(
     anchors: List[Tuple[float, float]] = [(0.0, lo), (1.0, hi)]
 
     for key, level in (
-        ("q01", 0.01), ("q05", 0.05), ("q25", 0.25),
+        ("q01", 0.01), ("q02", 0.02), ("q05", 0.05),
+        ("q10", 0.10), ("q20", 0.20), ("q25", 0.25), ("q35", 0.35),
         ("q50", 0.50),
-        ("q75", 0.75), ("q95", 0.95), ("q99", 0.99),
+        ("q65", 0.65), ("q75", 0.75), ("q80", 0.80),
+        ("q90", 0.90), ("q95", 0.95), ("q98", 0.98), ("q99", 0.99),
     ):
         val = spec.get(key)
         if val is not None:
@@ -3074,12 +3794,19 @@ def _quantile_cdf_sample(
     • Preserves the full distribution shape encoded in the quantile points
 
     FIX-13: adds small uniform jitter proportional to the local segment
-    width. With only ~9 quantile knots (min, q01, q05, q25, q50, q75, q95,
-    q99, max), the piecewise-linear interpolation alone produces a visible
-    "staircase" -- values cluster at knot points. The jitter is scaled to
-    10% of the local segment width so it never pushes a value into a
-    neighboring segment's density regime, and the result is clipped back
-    into [values[0], values[-1]] to preserve the bounded-output guarantee.
+    width. With a modest number of quantile knots, the piecewise-linear
+    interpolation alone can produce a visible "staircase" -- values
+    cluster at knot points. The jitter is scaled to 10% of the local
+    segment width so it never pushes a value into a neighboring segment's
+    density regime, and the result is clipped back into
+    [values[0], values[-1]] to preserve the bounded-output guarantee.
+
+    IMP-01: the jitter formula makes no assumption about how many knots
+    are present -- seg_widths is computed live from whatever `values`
+    array is actually passed in, so densifying the knot count (9 -> 17,
+    see _build_quantile_cdf) automatically narrows the segments jitter is
+    scaled to, with no change needed here. This was verified directly by
+    IMP-01's dedicated tests rather than assumed.
     """
     u = rng.uniform(0.0, 1.0, size=n)
     raw = np.interp(u, levels, values)
@@ -3091,6 +3818,31 @@ def _quantile_cdf_sample(
     seg_widths = np.diff(values)
     jitter = rng.uniform(-0.5, 0.5, size=n) * seg_widths[seg_indices] * 0.1
     return np.clip(raw + jitter, values[0], values[-1])
+
+def _sample_integer_empirical(
+    ratios: Dict[str, float],
+    n:      int,
+    rng:    np.random.Generator,
+) -> np.ndarray:
+    """
+    IMP-10: draw n values from a discrete empirical distribution stored as
+    {str(int_value): probability}. Used for low-cardinality integer columns
+    instead of quantile-CDF sampling + rounding.
+
+    Returns a float array (the shared numeric pipeline works in float and
+    casts to Int64 later in _fill_nan_numeric) but every value is an exact
+    whole number drawn from the observed support — including non-contiguous
+    support (e.g. {1, 2, 5, 10}), which the quantile-CDF path cannot
+    represent exactly.
+    """
+    choices = np.array([int(k) for k in ratios.keys()], dtype=float)
+    weights = np.array(list(ratios.values()), dtype=float)
+    if weights.sum() <= 0:
+        weights = np.ones(len(choices), dtype=float)
+    probs = weights / weights.sum()
+    idx = rng.choice(len(choices), size=n, p=probs)
+    return choices[idx]
+
 
 def _resample_out_of_range(
     arr:  np.ndarray,
@@ -3171,7 +3923,22 @@ def _apply_cholesky_correlations(
     except ImportError:
         _ndtr = None  # fallback defined below
 
-    pairs = bl.strong_pearson_pairs(threshold=0.4)
+    pairs = bl.strong_pearson_pairs(threshold=0.20)
+    if not pairs:
+        return data
+
+    # IMP-10: columns sampled from a discrete empirical distribution (see
+    # StatisticalEngine._sample_numeric_col) must not be overwritten here —
+    # step 5 below draws from the continuous quantile-CDF, which would
+    # silently reintroduce the exact "continuous then round" distortion
+    # IMP-10 exists to avoid. Drop any pair touching such a column; the
+    # other member of the pair still goes through the normal path alone
+    # (a single column can't be Cholesky-correlated against nothing).
+    def _is_discrete_empirical(c: str) -> bool:
+        return bool((bl.numeric.get(c) or {}).get("value_ratios"))
+
+    pairs = [(a, b, v) for a, b, v in pairs
+             if not _is_discrete_empirical(a) and not _is_discrete_empirical(b)]
     if not pairs:
         return data
 

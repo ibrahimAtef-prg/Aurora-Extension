@@ -67,16 +67,31 @@ class NumericColumnBaseline:
     mean: Optional[float] = None
     std: Optional[float] = None
     q01: Optional[float] = None
+    q02: Optional[float] = None
     q05: Optional[float] = None
+    q10: Optional[float] = None
+    q20: Optional[float] = None
     q25: Optional[float] = None
+    q35: Optional[float] = None
     q50: Optional[float] = None
+    q65: Optional[float] = None
     q75: Optional[float] = None
+    q80: Optional[float] = None
+    q90: Optional[float] = None
     q95: Optional[float] = None
+    q98: Optional[float] = None
     q99: Optional[float] = None
     iqr: Optional[float] = None
     outlier_bounds_iqr: Optional[Tuple[float, float]] = None  # (low, high)
     unique_count: Optional[int] = None
     is_integer: bool = False  # True when all original non-null values are whole numbers
+    # IMP-10: empirical frequency table {str(int_value): ratio}, populated only for
+    # "discrete-like" integer columns (is_integer=True AND 1 < unique_count <=
+    # low_cardinality_threshold — the same definition already used elsewhere in this
+    # file for discrete_like_numerics). None for every other numeric column, so old
+    # cached baselines (which lack this key) fall back to the pre-existing
+    # quantile-CDF sampling path with no code change required on the read side.
+    value_ratios: Optional[Dict[str, float]] = None
 
 @dataclass
 class CategoricalColumnBaseline:
@@ -220,7 +235,20 @@ def build_baseline(
             unique_count=int(non_null.nunique(dropna=True)) if len(non_null) else 0,
         )
         if len(non_null):
-            desc = non_null.describe(percentiles=[0.01, 0.05, 0.25, 0.50, 0.75, 0.95, 0.99])
+            # IMP-01: quantile knot densification — 17 knots total (min, max,
+            # plus 15 interior percentiles) instead of the original 9 (min,
+            # max, plus 7). The extra levels (2,10,20,35,65,80,90,98) were
+            # chosen after benchmarking 13/17/25-knot configurations against
+            # the original 9 across normal/skewed/heavy-tailed/bimodal/
+            # exponential distributions at several sample sizes: 17 gave the
+            # best Wasserstein-distance improvement over 9 and was more
+            # reliable than 25, which showed overfitting-like instability on
+            # some heavy-tailed and small-sample cases. See generator.py's
+            # _build_quantile_cdf docstring for how these anchors are used.
+            desc = non_null.describe(percentiles=[
+                0.01, 0.02, 0.05, 0.10, 0.20, 0.25, 0.35, 0.50,
+                0.65, 0.75, 0.80, 0.90, 0.95, 0.98, 0.99,
+            ])
 
             def _fget(key, fallback=None):
                 try:
@@ -236,11 +264,19 @@ def build_baseline(
             nb.mean = _fget("mean")
             nb.std  = _fget("std", 0.0)
             nb.q01  = _fget("1%")
+            nb.q02  = _fget("2%")
             nb.q05  = _fget("5%")
+            nb.q10  = _fget("10%")
+            nb.q20  = _fget("20%")
             nb.q25  = _fget("25%")
+            nb.q35  = _fget("35%")
             nb.q50  = _fget("50%")
+            nb.q65  = _fget("65%")
             nb.q75  = _fget("75%")
+            nb.q80  = _fget("80%")
+            nb.q90  = _fget("90%")
             nb.q95  = _fget("95%")
+            nb.q98  = _fget("98%")
             nb.q99  = _fget("99%")
 
             if nb.q25 is not None and nb.q75 is not None:
@@ -264,6 +300,23 @@ def build_baseline(
 
             # Constraints: range
             constraints.numeric_ranges[col] = (nb.min, nb.max)
+
+            # IMP-10: store the empirical frequency table for discrete/count-like
+            # low-cardinality integer columns, using the same qualification rule
+            # as discrete_like_numerics below (is_integer AND 1 < unique_count <=
+            # low_cardinality_threshold). This lets the generator sample these
+            # columns from their exact observed distribution instead of treating
+            # them as continuous and rounding afterward.
+            if (
+                nb.is_integer
+                and nb.unique_count is not None
+                and 1 < int(nb.unique_count) <= low_cardinality_threshold
+            ):
+                vc = non_null.value_counts(dropna=True)
+                denom = int(non_null.shape[0]) or 1
+                nb.value_ratios = {
+                    str(int(round(k))): (int(v) / denom) for k, v in vc.items()
+                }
 
         columns.numeric[col] = nb
 
